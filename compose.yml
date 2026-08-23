@@ -1,16 +1,12 @@
 name: pdf2zh-next
 
-# For a different server, edit these two persisted values in this file. Do not
-# pass them only as one-off shell variables: the certificate and cookie origin
-# must remain identical on every later `docker compose up`.
-x-public-ip: &public-ip "185.99.135.224"
-x-public-port: &public-port "7860"
-
 # Fresh VPS:
-#   docker compose up -d --pull always --wait --wait-timeout 600
-# Everything that must survive a move is created below this compose file in
-# ./data, ./secrets, and ./tls. Never run `docker compose down -v` as a cleanup
-# shortcut, and always copy those three directories when migrating the service.
+#   docker compose up -d --pull always --remove-orphans --wait --wait-timeout 600
+# The default public endpoint is HTTP on port 8199. No server IP, domain, TLS
+# certificate, or .env file is required. Set PDF2ZH_LISTEN=127.0.0.1:8199 if a
+# reverse proxy on the same host should be the only process reaching the app.
+# Everything required for migration lives in ./data and ./secrets. Never run
+# `docker compose down -v`, and always copy both directories with this file.
 
 x-logging: &default-logging
   driver: json-file
@@ -24,8 +20,6 @@ services:
     user: "0:0"
     restart: "no"
     network_mode: none
-    environment:
-      PDF2ZH_PUBLIC_IP: *public-ip
     cap_drop:
       - ALL
     cap_add:
@@ -38,12 +32,8 @@ services:
     volumes:
       - ./data/jobs:/data/jobs
       - ./data/state:/data/state
-      - ./data/certbot:/var/lib/letsencrypt
       - ./secrets/web:/run/pdf2zh-init-secrets/web
       - ./secrets/worker:/run/pdf2zh-init-secrets/worker
-      - ./tls/active:/run/pdf2zh-init-tls/active
-      - ./tls/letsencrypt:/run/pdf2zh-init-tls/letsencrypt
-      - ./tls/acme:/run/pdf2zh-init-tls/acme
 
   translator:
     image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-translator:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
@@ -110,8 +100,8 @@ services:
     security_opt:
       - no-new-privileges:true
     logging: *default-logging
-    expose:
-      - "7860"
+    ports:
+      - "${PDF2ZH_LISTEN:-8199}:7860"
     depends_on:
       init:
         condition: service_completed_successfully
@@ -125,10 +115,6 @@ services:
       PDF2ZH_FRONTEND_DIR: /app/frontend
       PDF2ZH_WORKER_URL: http://translator:8000
       PDF2ZH_WORKER_TOKEN_FILE: /run/pdf2zh-secrets/worker-token
-      PDF2ZH_PUBLIC_IP: *public-ip
-      PDF2ZH_PUBLIC_PORT: *public-port
-      PDF2ZH_SECURE_COOKIES: "true"
-      PDF2ZH_TRUST_X_FORWARDED_FOR: "true"
       PDF2ZH_MASTER_KEY_FILE: /run/pdf2zh-secrets/provider-master-key
       PDF2ZH_SETUP_TOKEN_FILE: /run/pdf2zh-secrets/admin-setup-token
       PDF2ZH_CONCURRENCY: "1"
@@ -146,7 +132,6 @@ services:
       - ./data/state:/data/state
       - ./secrets/web:/run/pdf2zh-secrets:ro
     networks:
-      - edge
       - worker
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:7860/api/health"]
@@ -155,87 +140,5 @@ services:
       retries: 8
       start_period: 10s
 
-  gateway:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-gateway:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
-    init: true
-    restart: unless-stopped
-    ports:
-      - target: 80
-        published: "80"
-        host_ip: "${PDF2ZH_BIND_ADDRESS:-0.0.0.0}"
-        protocol: tcp
-      - target: 7860
-        published: *public-port
-        host_ip: "${PDF2ZH_BIND_ADDRESS:-0.0.0.0}"
-        protocol: tcp
-    depends_on:
-      init:
-        condition: service_completed_successfully
-      web:
-        condition: service_healthy
-    environment:
-      PDF2ZH_PUBLIC_IP: *public-ip
-      PDF2ZH_PORT: *public-port
-      PDF2ZH_NGINX_RELOAD_SECONDS: "${PDF2ZH_NGINX_RELOAD_SECONDS:-60}"
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - NET_BIND_SERVICE
-      - SETGID
-      - SETUID
-    security_opt:
-      - no-new-privileges:true
-    logging: *default-logging
-    volumes:
-      - ./tls/active:/etc/pdf2zh-tls:ro
-      - ./tls/acme:/var/www/certbot:ro
-    networks:
-      - edge
-      - acme
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/pdf2zh-gateway-health"]
-      interval: 15s
-      timeout: 8s
-      retries: 12
-      start_period: 15s
-
-  certbot:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-ops:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
-    init: true
-    restart: unless-stopped
-    entrypoint: ["/usr/local/bin/pdf2zh-certbot-loop"]
-    command: []
-    depends_on:
-      init:
-        condition: service_completed_successfully
-      gateway:
-        condition: service_healthy
-    environment:
-      PDF2ZH_PUBLIC_IP: *public-ip
-      LETSENCRYPT_EMAIL: "${LETSENCRYPT_EMAIL:-}"
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-    security_opt:
-      - no-new-privileges:true
-    logging: *default-logging
-    volumes:
-      - ./data/certbot:/var/lib/letsencrypt
-      - ./tls/active:/run/pdf2zh-active-tls
-      - ./tls/letsencrypt:/etc/letsencrypt
-      - ./tls/acme:/var/www/certbot
-    networks:
-      - acme
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/pdf2zh-certbot-health"]
-      interval: 30s
-      timeout: 10s
-      retries: 4
-      start_period: 5m
-
 networks:
-  edge:
   worker:
-  acme:

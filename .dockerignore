@@ -6,6 +6,11 @@
 .pytest_cache
 .ruff_cache
 .venv
+/.uv-cache
+/.npm-cache
+/.cargo-cache
+/.cargo-registry
+/.cargo-git
 **/__pycache__
 **/*.pyc
 **/*.pyo

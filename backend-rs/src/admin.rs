@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
-use axum::http::header::{CACHE_CONTROL, COOKIE, ORIGIN, SET_COOKIE};
+use axum::http::header::{CACHE_CONTROL, COOKIE, HOST, ORIGIN, REFERER, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -50,8 +50,7 @@ pub(crate) struct AdminService(Arc<AdminServiceInner>);
 
 struct AdminServiceInner {
     pool: SqlitePool,
-    public_origin: String,
-    secure_cookies: bool,
+    public_origin: Option<String>,
     master_key: Option<Arc<Zeroizing<[u8; 32]>>>,
     setup_token_hash: Option<[u8; 32]>,
     dummy_password_hash: String,
@@ -196,6 +195,23 @@ struct AdminPrincipal {
     user_id: String,
     username: String,
     csrf_hash: Vec<u8>,
+    cookie_transport: CookieTransport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CookieTransport {
+    Http,
+    Https,
+}
+
+impl CookieTransport {
+    fn from_secure(secure: bool) -> Self {
+        if secure { Self::Https } else { Self::Http }
+    }
+
+    fn is_secure(self) -> bool {
+        self == Self::Https
+    }
 }
 
 struct NewSession {
@@ -291,7 +307,7 @@ struct EncryptedSecret {
 }
 
 impl AdminService {
-    pub(crate) async fn new(pool: SqlitePool, port: u16) -> Result<Self, BoxError> {
+    pub(crate) async fn new(pool: SqlitePool) -> Result<Self, BoxError> {
         sqlx::migrate!("./migrations").run(&pool).await?;
         // The credential-history scrub migration runs with secure_delete. A
         // truncate checkpoint also removes pre-migration WAL frames before the
@@ -300,32 +316,10 @@ impl AdminService {
             .execute(&pool)
             .await?;
 
-        let origin_text = match env::var("PDF2ZH_PUBLIC_ORIGIN") {
-            Ok(origin) => origin,
-            Err(_) => match env::var("PDF2ZH_PUBLIC_IP") {
-                Ok(public_ip) => {
-                    let public_port =
-                        env::var("PDF2ZH_PUBLIC_PORT").unwrap_or_else(|_| port.to_string());
-                    format!("https://{public_ip}:{public_port}")
-                }
-                Err(_) => format!("http://127.0.0.1:{port}"),
-            },
-        };
-        let origin = Url::parse(&origin_text)?;
-        if !matches!(origin.scheme(), "http" | "https")
-            || origin.host().is_none()
-            || origin.username() != ""
-            || origin.password().is_some()
-            || origin.query().is_some()
-            || origin.fragment().is_some()
-            || origin.path() != "/"
-        {
-            return Err("PDF2ZH_PUBLIC_ORIGIN must be an HTTP(S) origin without a path".into());
-        }
-        let public_origin = origin.origin().ascii_serialization();
-        let secure_cookies = match env::var("PDF2ZH_SECURE_COOKIES") {
-            Ok(value) => parse_bool_env("PDF2ZH_SECURE_COOKIES", &value)?,
-            Err(_) => origin.scheme() == "https",
+        let public_origin = match env::var("PDF2ZH_PUBLIC_ORIGIN") {
+            Ok(origin) => Some(parse_http_origin(&origin)?.origin().ascii_serialization()),
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(error.into()),
         };
         let trust_forwarded_for = match env::var("PDF2ZH_TRUST_X_FORWARDED_FOR") {
             Ok(value) => parse_bool_env("PDF2ZH_TRUST_X_FORWARDED_FOR", &value)?,
@@ -355,7 +349,6 @@ impl AdminService {
         Ok(Self(Arc::new(AdminServiceInner {
             pool,
             public_origin,
-            secure_cookies,
             master_key,
             setup_token_hash,
             dummy_password_hash,
@@ -416,8 +409,10 @@ impl AdminService {
 
     pub(crate) async fn config_session(&self, headers: &HeaderMap) -> Option<ConfigSession> {
         let principal = self.authenticate(headers).await.ok()?;
-        let csrf_token = cookie_value(headers, self.csrf_cookie_name())
-            .filter(|token| constant_eq(&hash_bytes(token.as_bytes()), &principal.csrf_hash));
+        let csrf_token =
+            unique_cookie_value(headers, Self::csrf_cookie_name(principal.cookie_transport))
+                .ok()?
+                .filter(|token| constant_eq(&hash_bytes(token.as_bytes()), &principal.csrf_hash));
         Some(ConfigSession { csrf_token })
     }
 
@@ -590,27 +585,20 @@ impl AdminService {
         Ok(count == 0)
     }
 
-    fn check_origin(&self, headers: &HeaderMap) -> Result<(), AdminError> {
-        let origin = headers
-            .get(ORIGIN)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(AdminError::Forbidden)?;
-        if origin != self.0.public_origin {
-            return Err(AdminError::Forbidden);
-        }
-        Ok(())
+    fn check_origin(&self, headers: &HeaderMap) -> Result<CookieTransport, AdminError> {
+        validate_request_origin(headers, self.0.public_origin.as_deref())
     }
 
-    fn session_cookie_name(&self) -> &'static str {
-        if self.0.secure_cookies {
+    fn session_cookie_name(transport: CookieTransport) -> &'static str {
+        if transport.is_secure() {
             SESSION_COOKIE_SECURE
         } else {
             SESSION_COOKIE_INSECURE
         }
     }
 
-    fn csrf_cookie_name(&self) -> &'static str {
-        if self.0.secure_cookies {
+    fn csrf_cookie_name(transport: CookieTransport) -> &'static str {
+        if transport.is_secure() {
             CSRF_COOKIE_SECURE
         } else {
             CSRF_COOKIE_INSECURE
@@ -622,22 +610,23 @@ impl AdminService {
         response: &mut Response,
         session_token: &str,
         csrf_token: &str,
+        transport: CookieTransport,
     ) -> Result<(), AdminError> {
-        let secure = if self.0.secure_cookies {
+        let secure = if transport.is_secure() {
             "; Secure"
         } else {
             ""
         };
         let session = format!(
             "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
-            self.session_cookie_name(),
+            Self::session_cookie_name(transport),
             session_token,
             SESSION_ABSOLUTE_SECONDS,
             secure
         );
         let csrf = format!(
             "{}={}; Path=/; SameSite=Strict; Max-Age={}{}",
-            self.csrf_cookie_name(),
+            Self::csrf_cookie_name(transport),
             csrf_token,
             SESSION_ABSOLUTE_SECONDS,
             secure
@@ -653,33 +642,79 @@ impl AdminService {
         Ok(())
     }
 
-    fn append_cleared_cookies(&self, response: &mut Response) -> Result<(), AdminError> {
-        let secure = if self.0.secure_cookies {
+    fn append_csrf_cookie(
+        &self,
+        response: &mut Response,
+        csrf_token: &str,
+        transport: CookieTransport,
+    ) -> Result<(), AdminError> {
+        let secure = if transport.is_secure() {
             "; Secure"
         } else {
             ""
         };
-        for name in [self.session_cookie_name(), self.csrf_cookie_name()] {
-            let cookie = format!(
-                "{name}=; Path=/; SameSite=Strict; Max-Age=0{}{}",
-                if name == self.session_cookie_name() {
-                    "; HttpOnly"
-                } else {
-                    ""
-                },
-                secure
-            );
-            response.headers_mut().append(
-                SET_COOKIE,
-                HeaderValue::from_str(&cookie).map_err(|_| AdminError::Internal)?,
-            );
+        let cookie = format!(
+            "{}={csrf_token}; Path=/; SameSite=Strict; Max-Age={}{}",
+            Self::csrf_cookie_name(transport),
+            SESSION_ABSOLUTE_SECONDS,
+            secure
+        );
+        response.headers_mut().append(
+            SET_COOKIE,
+            HeaderValue::from_str(&cookie).map_err(|_| AdminError::Internal)?,
+        );
+        Ok(())
+    }
+
+    fn append_cleared_cookies(&self, response: &mut Response) -> Result<(), AdminError> {
+        for transport in [CookieTransport::Http, CookieTransport::Https] {
+            let secure = if transport.is_secure() {
+                "; Secure"
+            } else {
+                ""
+            };
+            for name in [
+                Self::session_cookie_name(transport),
+                Self::csrf_cookie_name(transport),
+            ] {
+                let cookie = format!(
+                    "{name}=; Path=/; SameSite=Strict; Max-Age=0{}{}",
+                    if name == Self::session_cookie_name(transport) {
+                        "; HttpOnly"
+                    } else {
+                        ""
+                    },
+                    secure
+                );
+                response.headers_mut().append(
+                    SET_COOKIE,
+                    HeaderValue::from_str(&cookie).map_err(|_| AdminError::Internal)?,
+                );
+            }
         }
         Ok(())
     }
 
     async fn authenticate(&self, headers: &HeaderMap) -> Result<AdminPrincipal, AdminError> {
-        let token =
-            cookie_value(headers, self.session_cookie_name()).ok_or(AdminError::Unauthorized)?;
+        let secure_token = unique_cookie_value(headers, SESSION_COOKIE_SECURE)
+            .map_err(|_| AdminError::Unauthorized)?;
+        let insecure_token = unique_cookie_value(headers, SESSION_COOKIE_INSECURE)
+            .map_err(|_| AdminError::Unauthorized)?;
+        let requested_transport = request_transport_hint(headers, self.0.public_origin.as_deref())
+            .map_err(|_| AdminError::Unauthorized)?;
+        let (token, cookie_transport) = match requested_transport {
+            Some(CookieTransport::Https) => secure_token
+                .map(|token| (token, CookieTransport::Https))
+                .ok_or(AdminError::Unauthorized)?,
+            Some(CookieTransport::Http) => insecure_token
+                .map(|token| (token, CookieTransport::Http))
+                .ok_or(AdminError::Unauthorized)?,
+            None => match (secure_token, insecure_token) {
+                (Some(token), _) => (token, CookieTransport::Https),
+                (None, Some(token)) => (token, CookieTransport::Http),
+                (None, None) => return Err(AdminError::Unauthorized),
+            },
+        };
         let token_hash = hash_bytes(token.as_bytes()).to_vec();
         let now = Utc::now().timestamp();
         let row = sqlx::query(
@@ -719,13 +754,19 @@ impl AdminService {
             user_id: row.get("user_id"),
             username: row.get("username"),
             csrf_hash: row.get("csrf_hash"),
+            cookie_transport,
         })
     }
 
     async fn require_write(&self, headers: &HeaderMap) -> Result<AdminPrincipal, AdminError> {
         let principal = self.authenticate(headers).await?;
-        self.check_origin(headers)?;
-        let cookie = cookie_value(headers, self.csrf_cookie_name()).ok_or(AdminError::Forbidden)?;
+        let transport = self.check_origin(headers)?;
+        if transport != principal.cookie_transport {
+            return Err(AdminError::Forbidden);
+        }
+        let cookie = unique_cookie_value(headers, Self::csrf_cookie_name(transport))
+            .map_err(|_| AdminError::Forbidden)?
+            .ok_or(AdminError::Forbidden)?;
         let header = headers
             .get("x-csrf-token")
             .and_then(|value| value.to_str().ok())
@@ -1006,7 +1047,11 @@ async fn session(
     };
     let mut set_csrf = None;
     let csrf_token = if let Some(principal) = principal.as_ref() {
-        let current = cookie_value(&headers, service.csrf_cookie_name());
+        let current = unique_cookie_value(
+            &headers,
+            AdminService::csrf_cookie_name(principal.cookie_transport),
+        )
+        .map_err(|_| AdminError::Forbidden)?;
         if current
             .as_ref()
             .is_some_and(|value| constant_eq(&hash_bytes(value.as_bytes()), &principal.csrf_hash))
@@ -1040,21 +1085,11 @@ async fn session(
         HeaderValue::from_static("no-store"),
     );
     if let Some(csrf) = set_csrf {
-        let secure = if service.0.secure_cookies {
-            "; Secure"
-        } else {
-            ""
-        };
-        let cookie = format!(
-            "{}={csrf}; Path=/; SameSite=Strict; Max-Age={}{}",
-            service.csrf_cookie_name(),
-            SESSION_ABSOLUTE_SECONDS,
-            secure
-        );
-        response.headers_mut().append(
-            SET_COOKIE,
-            HeaderValue::from_str(&cookie).map_err(|_| AdminError::Internal)?,
-        );
+        let transport = principal
+            .as_ref()
+            .map(|principal| principal.cookie_transport)
+            .ok_or(AdminError::Internal)?;
+        service.append_csrf_cookie(&mut response, &csrf, transport)?;
     }
     Ok(response)
 }
@@ -1066,7 +1101,7 @@ async fn setup(
     Json(request): Json<SetupRequest>,
 ) -> Result<Response, AdminError> {
     let service = &state.0.admin;
-    service.check_origin(&headers)?;
+    let cookie_transport = service.check_origin(&headers)?;
     let peer = peer.map(|Extension(ConnectInfo(address))| address);
     let source = service.request_source(&headers, peer);
     let setup_rate_keys = [format!("setup:source:{source}")];
@@ -1158,7 +1193,12 @@ async fn setup(
         }),
     )
         .into_response();
-    service.append_session_cookies(&mut response, &new_session.token, &new_session.csrf_token)?;
+    service.append_session_cookies(
+        &mut response,
+        &new_session.token,
+        &new_session.csrf_token,
+        cookie_transport,
+    )?;
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
         HeaderValue::from_static("no-store"),
@@ -1173,7 +1213,7 @@ async fn login(
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, AdminError> {
     let service = &state.0.admin;
-    service.check_origin(&headers)?;
+    let cookie_transport = service.check_origin(&headers)?;
     let username_norm = validate_username(&request.username)?;
     validate_password(&request.password)?;
     let peer = peer.map(|Extension(ConnectInfo(address))| address);
@@ -1234,7 +1274,12 @@ async fn login(
         csrf_token: Some(new_session.csrf_token.clone()),
     })
     .into_response();
-    service.append_session_cookies(&mut response, &new_session.token, &new_session.csrf_token)?;
+    service.append_session_cookies(
+        &mut response,
+        &new_session.token,
+        &new_session.csrf_token,
+        cookie_transport,
+    )?;
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
         HeaderValue::from_static("no-store"),
@@ -2040,14 +2085,136 @@ fn runtime_secret_aad(job_id: Uuid, profile_id: &str, kind: &str, revision: i64)
     format!("pdf2zh/job-provider-secret/v1\0{job_id}\0{profile_id}\0{kind}\0{revision}")
 }
 
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get_all(COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .filter_map(|part| part.trim().split_once('='))
-        .find_map(|(candidate, value)| (candidate == name).then(|| value.to_owned()))
+fn parse_http_origin(value: &str) -> Result<Url, BoxError> {
+    let origin = Url::parse(value)?;
+    if !matches!(origin.scheme(), "http" | "https")
+        || origin.host().is_none()
+        || origin.username() != ""
+        || origin.password().is_some()
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || origin.path() != "/"
+    {
+        return Err("origin must be HTTP(S) and contain only a host and optional port".into());
+    }
+    Ok(origin)
+}
+
+fn parse_request_authority(scheme: &str, authority: &str) -> Result<Url, BoxError> {
+    let request_url = Url::parse(&format!("{scheme}://{authority}"))?;
+    if request_url.host().is_none()
+        || request_url.username() != ""
+        || request_url.password().is_some()
+        || request_url.query().is_some()
+        || request_url.fragment().is_some()
+        || request_url.path() != "/"
+    {
+        return Err("Host must contain only a host and optional port".into());
+    }
+    Ok(request_url)
+}
+
+fn validate_request_origin(
+    headers: &HeaderMap,
+    public_origin: Option<&str>,
+) -> Result<CookieTransport, AdminError> {
+    let origin_text = single_header_value(headers, ORIGIN.as_str()).ok_or(AdminError::Forbidden)?;
+    validate_same_origin_fetch(headers)?;
+    validate_origin_value(headers, public_origin, origin_text)
+}
+
+fn validate_same_origin_fetch(headers: &HeaderMap) -> Result<(), AdminError> {
+    let fetch_site_values = headers.get_all("sec-fetch-site");
+    let mut fetch_site = fetch_site_values.iter();
+    if let Some(value) = fetch_site.next()
+        && (fetch_site.next().is_some() || value.as_bytes() != b"same-origin")
+    {
+        return Err(AdminError::Forbidden);
+    }
+    Ok(())
+}
+
+fn validate_origin_value(
+    headers: &HeaderMap,
+    public_origin: Option<&str>,
+    origin_text: &str,
+) -> Result<CookieTransport, AdminError> {
+    let origin = parse_http_origin(origin_text).map_err(|_| AdminError::Forbidden)?;
+
+    if let Some(expected) = public_origin {
+        if origin.origin().ascii_serialization() != expected {
+            return Err(AdminError::Forbidden);
+        }
+    } else {
+        let host = single_header_value(headers, HOST.as_str()).ok_or(AdminError::Forbidden)?;
+        let request_url =
+            parse_request_authority(origin.scheme(), host).map_err(|_| AdminError::Forbidden)?;
+        if origin.host() != request_url.host()
+            || origin.port_or_known_default() != request_url.port_or_known_default()
+        {
+            return Err(AdminError::Forbidden);
+        }
+    }
+
+    Ok(CookieTransport::from_secure(origin.scheme() == "https"))
+}
+
+fn request_transport_hint(
+    headers: &HeaderMap,
+    public_origin: Option<&str>,
+) -> Result<Option<CookieTransport>, AdminError> {
+    validate_same_origin_fetch(headers)?;
+    if headers.contains_key("x-pdf2zh-origin") {
+        let value = single_header_value(headers, "x-pdf2zh-origin").ok_or(AdminError::Forbidden)?;
+        return validate_origin_value(headers, public_origin, value).map(Some);
+    }
+    if headers.contains_key(REFERER) {
+        let value = single_header_value(headers, REFERER.as_str()).ok_or(AdminError::Forbidden)?;
+        let referer = Url::parse(value).map_err(|_| AdminError::Forbidden)?;
+        if !matches!(referer.scheme(), "http" | "https")
+            || referer.host().is_none()
+            || referer.username() != ""
+            || referer.password().is_some()
+        {
+            return Err(AdminError::Forbidden);
+        }
+        return validate_origin_value(
+            headers,
+            public_origin,
+            &referer.origin().ascii_serialization(),
+        )
+        .map(Some);
+    }
+    Ok(None)
+}
+
+fn single_header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let values = headers.get_all(name);
+    let mut values = values.iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    first.to_str().ok()
+}
+
+fn unique_cookie_value(headers: &HeaderMap, name: &str) -> Result<Option<String>, ()> {
+    let mut found = None;
+    for header in headers.get_all(COOKIE) {
+        let header = header.to_str().map_err(|_| ())?;
+        for part in header.split(';') {
+            let Some((candidate, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if candidate == name {
+                if found.is_some() {
+                    return Err(());
+                }
+                found = Some(value.to_owned());
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn random_token(bytes: usize) -> Result<String, getrandom::Error> {
@@ -2242,6 +2409,115 @@ mod tests {
         assert!(semaphore.try_acquire_owned().is_ok());
     }
 
+    fn request_headers(origin: &str, host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_str(origin).unwrap());
+        headers.insert(HOST, HeaderValue::from_str(host).unwrap());
+        headers
+    }
+
+    #[test]
+    fn dynamic_origin_validation_supports_ip_domain_ports_and_ipv6() {
+        for (origin, host, expected) in [
+            (
+                "http://192.0.2.10:8199",
+                "192.0.2.10:8199",
+                CookieTransport::Http,
+            ),
+            (
+                "https://PDF.Example.com",
+                "pdf.example.com:443",
+                CookieTransport::Https,
+            ),
+            (
+                "https://pdf.example.com:18443",
+                "PDF.EXAMPLE.COM:18443",
+                CookieTransport::Https,
+            ),
+            (
+                "http://[2001:db8::1]:8199",
+                "[2001:db8::1]:8199",
+                CookieTransport::Http,
+            ),
+            (
+                "http://pdf.example.com",
+                "pdf.example.com:80",
+                CookieTransport::Http,
+            ),
+        ] {
+            let mut headers = request_headers(origin, host);
+            headers.insert(
+                "x-forwarded-host",
+                HeaderValue::from_static("attacker.invalid"),
+            );
+            headers.insert("x-forwarded-proto", HeaderValue::from_static("ftp"));
+            assert_eq!(validate_request_origin(&headers, None).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn dynamic_origin_validation_rejects_cross_origin_and_malformed_requests() {
+        for (origin, host) in [
+            ("https://evil.example", "pdf.example.com"),
+            ("https://pdf.example.com:444", "pdf.example.com"),
+            ("null", "pdf.example.com"),
+            ("ftp://pdf.example.com", "pdf.example.com"),
+            ("https://user@pdf.example.com", "pdf.example.com"),
+            ("https://pdf.example.com/path", "pdf.example.com"),
+            ("https://pdf.example.com?query=1", "pdf.example.com"),
+            ("https://pdf.example.com", "pdf.example.com/path"),
+        ] {
+            assert!(validate_request_origin(&request_headers(origin, host), None).is_err());
+        }
+
+        let mut missing_origin = HeaderMap::new();
+        missing_origin.insert(HOST, HeaderValue::from_static("pdf.example.com"));
+        assert!(validate_request_origin(&missing_origin, None).is_err());
+
+        let mut missing_host = HeaderMap::new();
+        missing_host.insert(ORIGIN, HeaderValue::from_static("https://pdf.example.com"));
+        assert!(validate_request_origin(&missing_host, None).is_err());
+
+        let mut repeated_origin = request_headers("https://pdf.example.com", "pdf.example.com");
+        repeated_origin.append(ORIGIN, HeaderValue::from_static("https://pdf.example.com"));
+        assert!(validate_request_origin(&repeated_origin, None).is_err());
+
+        let mut repeated_host = request_headers("https://pdf.example.com", "pdf.example.com");
+        repeated_host.append(HOST, HeaderValue::from_static("pdf.example.com"));
+        assert!(validate_request_origin(&repeated_host, None).is_err());
+
+        let mut cross_site = request_headers("https://pdf.example.com", "pdf.example.com");
+        cross_site.insert("sec-fetch-site", HeaderValue::from_static("same-site"));
+        assert!(validate_request_origin(&cross_site, None).is_err());
+        cross_site.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert_eq!(
+            validate_request_origin(&cross_site, None).unwrap(),
+            CookieTransport::Https
+        );
+    }
+
+    #[test]
+    fn pinned_origin_and_cookie_parsing_fail_closed() {
+        let matching = request_headers("https://pdf.example.com", "internal:7860");
+        assert_eq!(
+            validate_request_origin(&matching, Some("https://pdf.example.com")).unwrap(),
+            CookieTransport::Https
+        );
+        assert!(validate_request_origin(&matching, Some("https://pdf.example.com:444")).is_err());
+
+        let mut cookies = HeaderMap::new();
+        cookies.insert(
+            COOKIE,
+            HeaderValue::from_static("pdf2zh_session=first; pdf2zh_csrf=csrf"),
+        );
+        assert_eq!(
+            unique_cookie_value(&cookies, SESSION_COOKIE_INSECURE).unwrap(),
+            Some("first".to_owned())
+        );
+        cookies.append(COOKIE, HeaderValue::from_static("pdf2zh_session=second"));
+        assert!(unique_cookie_value(&cookies, SESSION_COOKIE_INSECURE).is_err());
+    }
+
     #[tokio::test]
     async fn serialized_setup_candidate_rechecks_completion_after_waiting() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2272,8 +2548,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let service = AdminService(Arc::new(AdminServiceInner {
             pool: pool.clone(),
-            public_origin: "https://example.test".to_owned(),
-            secure_cookies: true,
+            public_origin: Some("https://example.test".to_owned()),
             master_key: Some(Arc::new(Zeroizing::new([7_u8; 32]))),
             setup_token_hash: None,
             dummy_password_hash: "unused".to_owned(),
@@ -2323,6 +2598,21 @@ mod tests {
         let session = service.config_session(&headers).await.unwrap();
         assert_eq!(session.csrf_token.as_deref(), Some(csrf_token));
 
+        let mut migrated_headers = HeaderMap::new();
+        migrated_headers.insert(HOST, HeaderValue::from_static("example.test"));
+        migrated_headers.insert(
+            "x-pdf2zh-origin",
+            HeaderValue::from_static("https://example.test"),
+        );
+        migrated_headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!(
+                "{SESSION_COOKIE_INSECURE}={session_token}; {CSRF_COOKIE_INSECURE}={csrf_token}"
+            ))
+            .unwrap(),
+        );
+        assert!(service.config_session(&migrated_headers).await.is_none());
+
         headers.insert(
             COOKIE,
             HeaderValue::from_str(&format!(
@@ -2355,6 +2645,7 @@ mod tests {
             Err(PaidJobAuthorizationError::Forbidden)
         ));
         headers.insert(ORIGIN, HeaderValue::from_static("https://example.test"));
+        headers.insert(HOST, HeaderValue::from_static("example.test"));
         headers.insert("x-csrf-token", HeaderValue::from_static(csrf_token));
         assert!(service.authorize_paid_job(&headers).await.is_ok());
     }
@@ -2369,8 +2660,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let service = AdminService(Arc::new(AdminServiceInner {
             pool: pool.clone(),
-            public_origin: "https://example.test".to_owned(),
-            secure_cookies: true,
+            public_origin: Some("https://example.test".to_owned()),
             master_key: Some(Arc::new(Zeroizing::new([7_u8; 32]))),
             setup_token_hash: None,
             dummy_password_hash: "unused".to_owned(),

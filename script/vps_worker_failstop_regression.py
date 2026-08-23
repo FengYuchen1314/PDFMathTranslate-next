@@ -64,9 +64,14 @@ def resolve_container(explicit: str | None, compose_project: str) -> str:
 def worker_health(container: str) -> dict:
     code = """\
 import json, os, urllib.request
+from pathlib import Path
+token_file = os.environ.get(
+    "PDF2ZH_WORKER_TOKEN_FILE", "/run/pdf2zh-secrets/token"
+)
+token = Path(token_file).read_text(encoding="utf-8").rstrip("\\r\\n")
 request = urllib.request.Request(
     "http://127.0.0.1:8000/internal/health",
-    headers={"x-worker-token": os.environ["PDF2ZH_WORKER_TOKEN"]},
+    headers={"x-worker-token": token},
 )
 with urllib.request.urlopen(request, timeout=3) as response:
     print(json.dumps(json.load(response)))

@@ -66,11 +66,14 @@ async function requestJson<T>(
   init?: RequestInit,
   timeoutMs = CONTROL_REQUEST_TIMEOUT_MS,
 ): Promise<T> {
+  const headers = new Headers(init?.headers);
+  headers.set("X-PDF2ZH-Origin", window.location.origin);
   const response = await fetchWithTimeout(
     apiUrl(path),
     {
       credentials: "same-origin",
       ...init,
+      headers,
     },
     timeoutMs,
   );

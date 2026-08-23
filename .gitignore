@@ -131,6 +131,11 @@ celerybeat.pid
 # Environments
 .env
 .venv
+/.uv-cache/
+/.npm-cache/
+/.cargo-cache/
+/.cargo-registry/
+/.cargo-git/
 env/
 venv/
 ENV/

@@ -40,45 +40,42 @@ PDF scientific paper translation and bilingual comparison. Based on [BabelDOC](h
 > Rust API and practical React single-page application; FastAPI is an internal
 > BabelDOC bridge. Google is built in. The first administrator registers at
 > `/admin`, then stores DeepSeek or other HTTPS OpenAI-compatible providers in
-> the encrypted server-side provider store. API keys are never sent to or kept
-> by the browser. DeepSeek follows the current V4 Flash/Pro API. See
+> the encrypted server-side provider store. API keys are sent only when an
+> administrator saves them, are not persisted by the browser, and are never
+> returned by the backend. DeepSeek follows the current V4 Flash/Pro API. See
 > [docs/architecture-rust-fastapi.md](./docs/architecture-rust-fastapi.md) for the
 > lifecycle, cancellation guarantees, deployment, and verification commands.
 
 ## Portable Compose deployment
 
 The supported server deployment needs only [`compose.yml`](./compose.yml).
-GitHub Actions tests the Python, Rust, and React code and publishes the four
+GitHub Actions tests the Python, Rust, and React code and publishes the three
 multi-architecture images to GHCR; the target server never compiles source.
 This path supports rootful Docker on Linux, Docker Compose v2.24 or newer, and
-a local POSIX filesystem. For the default VPS (`185.99.135.224`), open inbound
-TCP ports `80` and `7860`, put the Compose file in an empty directory, and run:
+a local POSIX filesystem. Open inbound TCP port `8199`, put the Compose file in
+an empty directory, and run:
 
 ```bash
-docker compose up -d --pull always --wait --wait-timeout 600
+docker compose up -d --pull always --remove-orphans --wait --wait-timeout 600
 ```
 
 ### Complete `compose.yml` (copy directly)
 
-多数用户可以直接复制下面的完整内容，保存为 `compose.yml`。在其他
-VPS 部署时，只需先修改开头的 `x-public-ip` 和 `x-public-port`，然后运行
-上面的 `docker compose up` 命令；不需要再下载源码或创建 `.env` 文件。
+多数用户可以直接复制下面的完整内容，保存为 `compose.yml`，然后运行上面的
+命令。无需填写服务器 IP、域名或证书，也不需要下载源码或创建 `.env` 文件。
+启动后直接访问 `http://服务器IP:8199`。
 
 <!-- BEGIN PORTABLE COMPOSE -->
 ```yaml
 name: pdf2zh-next
 
-# For a different server, edit these two persisted values in this file. Do not
-# pass them only as one-off shell variables: the certificate and cookie origin
-# must remain identical on every later `docker compose up`.
-x-public-ip: &public-ip "185.99.135.224"
-x-public-port: &public-port "7860"
-
 # Fresh VPS:
-#   docker compose up -d --pull always --wait --wait-timeout 600
-# Everything that must survive a move is created below this compose file in
-# ./data, ./secrets, and ./tls. Never run `docker compose down -v` as a cleanup
-# shortcut, and always copy those three directories when migrating the service.
+#   docker compose up -d --pull always --remove-orphans --wait --wait-timeout 600
+# The default public endpoint is HTTP on port 8199. No server IP, domain, TLS
+# certificate, or .env file is required. Set PDF2ZH_LISTEN=127.0.0.1:8199 if a
+# reverse proxy on the same host should be the only process reaching the app.
+# Everything required for migration lives in ./data and ./secrets. Never run
+# `docker compose down -v`, and always copy both directories with this file.
 
 x-logging: &default-logging
   driver: json-file
@@ -92,8 +89,6 @@ services:
     user: "0:0"
     restart: "no"
     network_mode: none
-    environment:
-      PDF2ZH_PUBLIC_IP: *public-ip
     cap_drop:
       - ALL
     cap_add:
@@ -106,12 +101,8 @@ services:
     volumes:
       - ./data/jobs:/data/jobs
       - ./data/state:/data/state
-      - ./data/certbot:/var/lib/letsencrypt
       - ./secrets/web:/run/pdf2zh-init-secrets/web
       - ./secrets/worker:/run/pdf2zh-init-secrets/worker
-      - ./tls/active:/run/pdf2zh-init-tls/active
-      - ./tls/letsencrypt:/run/pdf2zh-init-tls/letsencrypt
-      - ./tls/acme:/run/pdf2zh-init-tls/acme
 
   translator:
     image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-translator:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
@@ -178,8 +169,8 @@ services:
     security_opt:
       - no-new-privileges:true
     logging: *default-logging
-    expose:
-      - "7860"
+    ports:
+      - "${PDF2ZH_LISTEN:-8199}:7860"
     depends_on:
       init:
         condition: service_completed_successfully
@@ -193,10 +184,6 @@ services:
       PDF2ZH_FRONTEND_DIR: /app/frontend
       PDF2ZH_WORKER_URL: http://translator:8000
       PDF2ZH_WORKER_TOKEN_FILE: /run/pdf2zh-secrets/worker-token
-      PDF2ZH_PUBLIC_IP: *public-ip
-      PDF2ZH_PUBLIC_PORT: *public-port
-      PDF2ZH_SECURE_COOKIES: "true"
-      PDF2ZH_TRUST_X_FORWARDED_FOR: "true"
       PDF2ZH_MASTER_KEY_FILE: /run/pdf2zh-secrets/provider-master-key
       PDF2ZH_SETUP_TOKEN_FILE: /run/pdf2zh-secrets/admin-setup-token
       PDF2ZH_CONCURRENCY: "1"
@@ -214,7 +201,6 @@ services:
       - ./data/state:/data/state
       - ./secrets/web:/run/pdf2zh-secrets:ro
     networks:
-      - edge
       - worker
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:7860/api/health"]
@@ -223,97 +209,14 @@ services:
       retries: 8
       start_period: 10s
 
-  gateway:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-gateway:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
-    init: true
-    restart: unless-stopped
-    ports:
-      - target: 80
-        published: "80"
-        host_ip: "${PDF2ZH_BIND_ADDRESS:-0.0.0.0}"
-        protocol: tcp
-      - target: 7860
-        published: *public-port
-        host_ip: "${PDF2ZH_BIND_ADDRESS:-0.0.0.0}"
-        protocol: tcp
-    depends_on:
-      init:
-        condition: service_completed_successfully
-      web:
-        condition: service_healthy
-    environment:
-      PDF2ZH_PUBLIC_IP: *public-ip
-      PDF2ZH_PORT: *public-port
-      PDF2ZH_NGINX_RELOAD_SECONDS: "${PDF2ZH_NGINX_RELOAD_SECONDS:-60}"
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - NET_BIND_SERVICE
-      - SETGID
-      - SETUID
-    security_opt:
-      - no-new-privileges:true
-    logging: *default-logging
-    volumes:
-      - ./tls/active:/etc/pdf2zh-tls:ro
-      - ./tls/acme:/var/www/certbot:ro
-    networks:
-      - edge
-      - acme
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/pdf2zh-gateway-health"]
-      interval: 15s
-      timeout: 8s
-      retries: 12
-      start_period: 15s
-
-  certbot:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-ops:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
-    init: true
-    restart: unless-stopped
-    entrypoint: ["/usr/local/bin/pdf2zh-certbot-loop"]
-    command: []
-    depends_on:
-      init:
-        condition: service_completed_successfully
-      gateway:
-        condition: service_healthy
-    environment:
-      PDF2ZH_PUBLIC_IP: *public-ip
-      LETSENCRYPT_EMAIL: "${LETSENCRYPT_EMAIL:-}"
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-    security_opt:
-      - no-new-privileges:true
-    logging: *default-logging
-    volumes:
-      - ./data/certbot:/var/lib/letsencrypt
-      - ./tls/active:/run/pdf2zh-active-tls
-      - ./tls/letsencrypt:/etc/letsencrypt
-      - ./tls/acme:/var/www/certbot
-    networks:
-      - acme
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/pdf2zh-certbot-health"]
-      interval: 30s
-      timeout: 10s
-      retries: 4
-      start_period: 5m
-
 networks:
-  edge:
   worker:
-  acme:
 ```
 <!-- END PORTABLE COMPOSE -->
 
-The first start creates `data/`, `secrets/`, and `tls/` beside the Compose
-file, requests the trusted short-lived IP certificate, and enables automatic
-renewal. Read the one-time administrator claim token locally on the server,
-then open `https://185.99.135.224:7860/admin`:
+The first start creates `data/` and `secrets/` beside the Compose file. Read the
+one-time administrator claim token locally on the server, then open
+`http://服务器IP:8199/admin`:
 
 ```bash
 sudo cat ./secrets/web/admin-setup-token
@@ -322,21 +225,33 @@ sudo cat ./secrets/web/admin-setup-token
 The first successful claim creates the administrator. That administrator adds
 the DeepSeek key in the backend, or defines another HTTPS OpenAI-compatible
 provider and its explicit model allow-list. Anonymous users can use only
-Google. No provider API key belongs in Compose or in a browser.
+Google. Provider API keys are not stored persistently by the browser and are
+never returned to it by the backend.
 
-The distributed Compose file already pins all four images to one tested Git
-commit. To update, replace it with the next release's Compose file and run the
-same command. To select another tested release explicitly, prefix the command
-with `PDF2ZH_IMAGE_TAG=sha-<full-40-character-commit>`. For a different VPS,
-edit the `x-public-ip` and `x-public-port` values in the file once; they then
-remain part of the portable configuration. For migration, stop the service and
-copy the entire directory; the Compose file and its three runtime directories
-are the complete portable unit.
+The distributed Compose file already pins all three images to one tested Git
+commit. To update, first back up the portable directory, replace it with the
+next release's Compose file, and run the same command. `--remove-orphans`
+removes services retired by the new Compose without deleting `data/` or
+`secrets/`. To select another tested release explicitly, prefix the command
+with `PDF2ZH_IMAGE_TAG=sha-<full-40-character-commit>`. No IP-specific setting
+is stored. For migration, stop the service and copy the entire directory; the
+Compose file, `data/`, and `secrets/` are the complete portable unit.
+
+Raw HTTP does not protect the administrator password, session, or provider API
+keys in transit. Use it only on a trusted network; for an Internet-facing admin
+page, terminate HTTPS in your own Nginx, Caddy, Traefik, or control panel and
+proxy to `http://127.0.0.1:8199`. The application automatically checks the
+browser Origin against the forwarded `Host` and selects Secure cookies for an
+HTTPS origin, so no domain needs to be added to Compose. The proxy must preserve
+the original Host including a non-standard port, must not rewrite `Origin`, and
+should disable request/response buffering with an upload limit of at least
+102 MiB and a read timeout of at least one hour. For same-host proxying, change
+the published port to `127.0.0.1:8199:7860` so port 8199 is not public.
 
 Before packing a migration, wait until the translation queue is idle, stop the
-stack, and archive from its parent directory so ownership, modes, and Certbot
-symlinks are preserved. The archive contains API credentials and TLS private
-keys, so encrypt it and restrict access:
+stack, and archive from its parent directory so ownership and modes are
+preserved. The archive contains API credentials, so encrypt it and restrict
+access:
 
 ```bash
 docker compose stop

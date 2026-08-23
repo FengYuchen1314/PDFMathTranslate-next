@@ -68,10 +68,10 @@ describe("createJob admission retry", () => {
     expect(form.get("pages")).toBe("1-3");
 
     for (const [, init] of fetchMock.mock.calls) {
-      expect(init?.headers).toEqual({
-        "x-job-id": RESERVED_JOB_ID,
-        "X-CSRF-Token": "csrf-token",
-      });
+      const headers = new Headers(init?.headers);
+      expect(headers.get("x-job-id")).toBe(RESERVED_JOB_ID);
+      expect(headers.get("x-csrf-token")).toBe("csrf-token");
+      expect(headers.get("x-pdf2zh-origin")).toBe(window.location.origin);
     }
   });
 

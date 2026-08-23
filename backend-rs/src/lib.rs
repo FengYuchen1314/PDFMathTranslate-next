@@ -741,7 +741,7 @@ impl AppState {
         #[cfg(unix)]
         fs::set_permissions(&upload_root, std::fs::Permissions::from_mode(0o700)).await?;
         let persistence = Persistence::open(&config.state_root).await?;
-        let admin = admin::AdminService::new(persistence.pool.clone(), config.port).await?;
+        let admin = admin::AdminService::new(persistence.pool.clone()).await?;
         let client = build_worker_client()?;
         let state = Self(Arc::new(AppStateInner {
             permits: Arc::new(Semaphore::new(config.concurrency)),

@@ -1,7 +1,0 @@
-services:
-  web:
-    image: "pdf2zh-next-web:${PDF2ZH_ROLLBACK_APP_IMAGE_TAG:?set the saved rollback app tag}"
-  translator:
-    image: "pdf2zh-next-translator:${PDF2ZH_ROLLBACK_APP_IMAGE_TAG:?set the saved rollback app tag}"
-  gateway:
-    image: "pdf2zh-next-gateway:${PDF2ZH_ROLLBACK_GATEWAY_IMAGE_TAG:?set the saved rollback gateway tag}"

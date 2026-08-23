@@ -29,7 +29,12 @@ jobs:
       - name: Install all dependency groups
         run: uv sync --all-groups
       - name: Lint Python
-        run: uv run ruff check pdf2zh_next tests test/test_cache.py
+        run: >-
+          uv run ruff check pdf2zh_next tests test/test_cache.py
+          script/portable_compose_regression.py
+          script/vps_admin_no_paid_regression.py
+          script/vps_rust_api_regression.py
+          script/vps_worker_failstop_regression.py
       - name: Run Python tests
         run: uv run pytest -q tests test/test_cache.py
       - name: Build Python package
@@ -74,201 +79,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Validate Compose, README copy, and shell syntax
-        run: |
-          docker compose -f compose.yml config --quiet
-          test "$(grep -c '<!-- BEGIN PORTABLE COMPOSE -->' README.md)" -eq 1
-          test "$(grep -c '<!-- END PORTABLE COMPOSE -->' README.md)" -eq 1
-          awk '
-            /<!-- BEGIN PORTABLE COMPOSE -->/ { capture = 1; next }
-            /<!-- END PORTABLE COMPOSE -->/ { capture = 0 }
-            capture { print }
-          ' README.md | sed '1d;$d' > /tmp/readme-compose.yml
-          cmp --silent compose.yml /tmp/readme-compose.yml
-          sh -n deploy/portable-init.sh
-          sh -n deploy/portable-certbot-loop.sh
-          sh -n deploy/portable-certbot-health.sh
-          sh -n deploy/gateway-entrypoint.sh
-          sh -n deploy/gateway-health.sh
-          sh -n deploy/nginx-reload-loop.sh
-          sh -n deploy/nginx-portable-reload-loop.sh
-      - name: Build deployment support images
-        run: |
-          docker build --file deploy/Dockerfile.ops --tag pdf2zh-ops:test .
-          docker build --file deploy/Dockerfile.gateway --tag pdf2zh-gateway:test .
+      - name: Validate the zero-configuration Compose and README copy
+        run: python3 script/portable_compose_regression.py
+      - name: Build the initialization image
+        run: docker build --file deploy/Dockerfile.ops --tag pdf2zh-ops:test .
       - name: Verify first start, idempotency, and fail-closed recovery
-        shell: bash
-        run: |
-          set -euo pipefail
-          portable_root="$(mktemp -d)"
-          test -n "${portable_root}" && test "${portable_root}" != "/"
-          mkdir -p \
-            "${portable_root}/data/jobs" \
-            "${portable_root}/data/state" \
-            "${portable_root}/data/certbot" \
-            "${portable_root}/secrets/web" \
-            "${portable_root}/secrets/worker" \
-            "${portable_root}/tls/active" \
-            "${portable_root}/tls/letsencrypt" \
-            "${portable_root}/tls/acme"
-
-          run_init() {
-            docker run --rm \
-              --cap-drop ALL \
-              --cap-add CHOWN \
-              --cap-add DAC_OVERRIDE \
-              --cap-add FOWNER \
-              -e PDF2ZH_PUBLIC_IP=192.0.2.10 \
-              -v "${portable_root}/data/jobs:/data/jobs" \
-              -v "${portable_root}/data/state:/data/state" \
-              -v "${portable_root}/data/certbot:/var/lib/letsencrypt" \
-              -v "${portable_root}/secrets/web:/run/pdf2zh-init-secrets/web" \
-              -v "${portable_root}/secrets/worker:/run/pdf2zh-init-secrets/worker" \
-              -v "${portable_root}/tls/active:/run/pdf2zh-init-tls/active" \
-              -v "${portable_root}/tls/letsencrypt:/run/pdf2zh-init-tls/letsencrypt" \
-              -v "${portable_root}/tls/acme:/run/pdf2zh-init-tls/acme" \
-              pdf2zh-ops:test
-          }
-
-          run_init
-          sudo test -s "${portable_root}/secrets/web/provider-master-key"
-          sudo test -s "${portable_root}/secrets/web/admin-setup-token"
-          sudo cmp \
-            "${portable_root}/secrets/web/worker-token" \
-            "${portable_root}/secrets/worker/token"
-          sudo openssl x509 \
-            -in "${portable_root}/tls/active/fullchain.pem" \
-            -noout -ext subjectAltName | grep -Fq 'IP Address:192.0.2.10'
-
-          secret_hashes_before="$(
-            sudo sha256sum \
-              "${portable_root}/secrets/web/provider-master-key" \
-              "${portable_root}/secrets/web/admin-setup-token" \
-              "${portable_root}/secrets/web/worker-token" \
-              "${portable_root}/secrets/worker/token"
-          )"
-          run_init
-          secret_hashes_after="$(
-            sudo sha256sum \
-              "${portable_root}/secrets/web/provider-master-key" \
-              "${portable_root}/secrets/web/admin-setup-token" \
-              "${portable_root}/secrets/web/worker-token" \
-              "${portable_root}/secrets/worker/token"
-          )"
-          test "${secret_hashes_before}" = "${secret_hashes_after}"
-
-          docker run --rm \
-            --cap-drop ALL \
-            --cap-add CHOWN \
-            --cap-add NET_BIND_SERVICE \
-            --cap-add SETGID \
-            --cap-add SETUID \
-            -e PDF2ZH_PUBLIC_IP=192.0.2.10 \
-            -e PDF2ZH_PORT=7860 \
-            -v "${portable_root}/tls/active:/etc/pdf2zh-tls:ro" \
-            pdf2zh-gateway:test nginx -t
-
-          gateway_container="pdf2zh-gateway-test-${GITHUB_RUN_ID}"
-          trap 'docker rm --force "${gateway_container}" >/dev/null 2>&1 || true' EXIT
-          docker run --detach \
-            --name "${gateway_container}" \
-            --cap-drop ALL \
-            --cap-add CHOWN \
-            --cap-add NET_BIND_SERVICE \
-            --cap-add SETGID \
-            --cap-add SETUID \
-            -e PDF2ZH_PUBLIC_IP=192.0.2.10 \
-            -e PDF2ZH_PORT=7860 \
-            -e PDF2ZH_NGINX_RELOAD_SECONDS=5 \
-            -p 127.0.0.1:18443:7860 \
-            -v "${portable_root}/tls/active:/etc/pdf2zh-tls:ro" \
-            pdf2zh-gateway:test
-          bootstrap_status=""
-          for _ in {1..30}; do
-            bootstrap_status="$(
-              curl --insecure --silent --output /dev/null \
-                --write-out '%{http_code}' https://127.0.0.1:18443/ || true
-            )"
-            if [[ "${bootstrap_status}" == "503" ]]; then
-              break
-            fi
-            sleep 1
-          done
-          test "${bootstrap_status}" = "503"
-
-          sudo openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 7 \
-            -subj '/CN=192.0.2.10' \
-            -addext 'subjectAltName=IP:192.0.2.10' \
-            -keyout "${portable_root}/tls/active/.privkey.next" \
-            -out "${portable_root}/tls/active/.fullchain.next" \
-            >/dev/null 2>&1
-          sudo chmod 0600 "${portable_root}/tls/active/.privkey.next"
-          sudo chmod 0644 "${portable_root}/tls/active/.fullchain.next"
-          expected_fingerprint="$(
-            sudo openssl x509 -sha256 -fingerprint -noout \
-              -in "${portable_root}/tls/active/.fullchain.next"
-          )"
-          sudo mv \
-            "${portable_root}/tls/active/.privkey.next" \
-            "${portable_root}/tls/active/privkey.pem"
-          sudo mv \
-            "${portable_root}/tls/active/.fullchain.next" \
-            "${portable_root}/tls/active/fullchain.pem"
-          served_fingerprint=""
-          for _ in {1..30}; do
-            served_fingerprint="$(
-              openssl s_client \
-                -connect 127.0.0.1:18443 \
-                -servername 192.0.2.10 </dev/null 2>/dev/null \
-                | openssl x509 -sha256 -fingerprint -noout 2>/dev/null \
-                || true
-            )"
-            if [[ "${served_fingerprint}" == "${expected_fingerprint}" ]]; then
-              break
-            fi
-            sleep 1
-          done
-          test "${served_fingerprint}" = "${expected_fingerprint}"
-          docker rm --force "${gateway_container}"
-          trap - EXIT
-
-          sudo mv \
-            "${portable_root}/secrets/web/provider-master-key" \
-            "${portable_root}/provider-master-key.saved"
-          printf 'persisted state\n' \
-            | sudo tee "${portable_root}/data/state/recovery-guard" >/dev/null
-          if run_init; then
-            echo 'init replaced a lost master key while state existed' >&2
-            exit 1
-          fi
-          sudo mv \
-            "${portable_root}/provider-master-key.saved" \
-            "${portable_root}/secrets/web/provider-master-key"
-
-          printf 'mismatch\n' \
-            | sudo tee "${portable_root}/secrets/worker/token" >/dev/null
-          if run_init; then
-            echo 'init accepted mismatched worker tokens' >&2
-            exit 1
-          fi
-
-          sudo mv \
-            "${portable_root}/secrets/web/worker-token" \
-            "${portable_root}/web-worker-token.saved"
-          sudo mv \
-            "${portable_root}/secrets/worker/token" \
-            "${portable_root}/translator-worker-token.saved"
-          if run_init; then
-            echo 'init replaced both lost worker tokens while state existed' >&2
-            exit 1
-          fi
-
-          if docker run --rm \
-            -e 'PDF2ZH_PUBLIC_IP=invalid;value' \
-            pdf2zh-gateway:test nginx -t; then
-            echo 'gateway accepted an unsafe public IP value' >&2
-            exit 1
-          fi
+        run: bash script/portable_init_regression.sh
 
   prepare:
     name: Prepare GHCR release
@@ -315,14 +131,6 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
             dockerfile: ./deploy/Dockerfile.worker
-          - component: gateway
-            arch: amd64
-            runner: ubuntu-24.04
-            dockerfile: ./deploy/Dockerfile.gateway
-          - component: gateway
-            arch: arm64
-            runner: ubuntu-24.04-arm
-            dockerfile: ./deploy/Dockerfile.gateway
           - component: ops
             arch: amd64
             runner: ubuntu-24.04
@@ -380,7 +188,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [web, translator, gateway, ops]
+        component: [web, translator, ops]
     steps:
       - name: Download architecture digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

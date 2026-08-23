@@ -304,20 +304,27 @@ def main() -> None:
         ),
     )
     parser.add_argument("--test-lease", action="store_true")
+    parser.add_argument(
+        "--require-hsts",
+        action="store_true",
+        help="also require the user-managed HTTPS proxy to emit HSTS",
+    )
     options = parser.parse_args()
     base_url = options.base_url.rstrip("/")
     parsed_base_url = urlsplit(base_url)
     if parsed_base_url.scheme not in {"http", "https"} or not parsed_base_url.netloc:
         raise ValueError("base_url must be an absolute HTTP(S) URL")
 
-    if parsed_base_url.scheme == "https":
-        with urlopen(f"{base_url}/", timeout=60) as response:  # noqa: S310
-            headers = response.headers
+    with urlopen(f"{base_url}/", timeout=60) as response:  # noqa: S310
+        headers = response.headers
+        if options.require_hsts:
+            if parsed_base_url.scheme != "https":
+                raise ValueError("--require-hsts requires an HTTPS base_url")
             assert "max-age=" in headers.get("Strict-Transport-Security", "")
-            assert "default-src 'self'" in headers.get("Content-Security-Policy", "")
-            assert headers.get("X-Content-Type-Options") == "nosniff"
-            assert headers.get("X-Frame-Options") == "DENY"
-        print("gateway_security_headers=passed", flush=True)
+        assert "default-src 'self'" in headers.get("Content-Security-Policy", "")
+        assert headers.get("X-Content-Type-Options") == "nosniff"
+        assert headers.get("X-Frame-Options") == "DENY"
+    print("application_security_headers=passed", flush=True)
 
     health = request_json(f"{base_url}/api/health")
     config = request_json(f"{base_url}/api/config")
