@@ -74,9 +74,17 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Validate Compose and shell syntax
+      - name: Validate Compose, README copy, and shell syntax
         run: |
           docker compose -f compose.yml config --quiet
+          test "$(grep -c '<!-- BEGIN PORTABLE COMPOSE -->' README.md)" -eq 1
+          test "$(grep -c '<!-- END PORTABLE COMPOSE -->' README.md)" -eq 1
+          awk '
+            /<!-- BEGIN PORTABLE COMPOSE -->/ { capture = 1; next }
+            /<!-- END PORTABLE COMPOSE -->/ { capture = 0 }
+            capture { print }
+          ' README.md | sed '1d;$d' > /tmp/readme-compose.yml
+          cmp --silent compose.yml /tmp/readme-compose.yml
           sh -n deploy/portable-init.sh
           sh -n deploy/portable-certbot-loop.sh
           sh -n deploy/portable-certbot-health.sh

@@ -58,6 +58,258 @@ TCP ports `80` and `7860`, put the Compose file in an empty directory, and run:
 docker compose up -d --pull always --wait --wait-timeout 600
 ```
 
+### Complete `compose.yml` (copy directly)
+
+多数用户可以直接复制下面的完整内容，保存为 `compose.yml`。在其他
+VPS 部署时，只需先修改开头的 `x-public-ip` 和 `x-public-port`，然后运行
+上面的 `docker compose up` 命令；不需要再下载源码或创建 `.env` 文件。
+
+<!-- BEGIN PORTABLE COMPOSE -->
+```yaml
+name: pdf2zh-next
+
+# For a different server, edit these two persisted values in this file. Do not
+# pass them only as one-off shell variables: the certificate and cookie origin
+# must remain identical on every later `docker compose up`.
+x-public-ip: &public-ip "185.99.135.224"
+x-public-port: &public-port "7860"
+
+# Fresh VPS:
+#   docker compose up -d --pull always --wait --wait-timeout 600
+# Everything that must survive a move is created below this compose file in
+# ./data, ./secrets, and ./tls. Never run `docker compose down -v` as a cleanup
+# shortcut, and always copy those three directories when migrating the service.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  init:
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-ops:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    environment:
+      PDF2ZH_PUBLIC_IP: *public-ip
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    volumes:
+      - ./data/jobs:/data/jobs
+      - ./data/state:/data/state
+      - ./data/certbot:/var/lib/letsencrypt
+      - ./secrets/web:/run/pdf2zh-init-secrets/web
+      - ./secrets/worker:/run/pdf2zh-init-secrets/worker
+      - ./tls/active:/run/pdf2zh-init-tls/active
+      - ./tls/letsencrypt:/run/pdf2zh-init-tls/letsencrypt
+      - ./tls/acme:/run/pdf2zh-init-tls/acme
+
+  translator:
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-translator:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    mem_limit: 8g
+    pids_limit: 512
+    cap_drop:
+      - ALL
+    cap_add:
+      # The root supervisor drops Uvicorn to 10001:10001. KILL is retained
+      # only so it can destroy that different-UID translation process group.
+      - KILL
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    expose:
+      - "8000"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      TZ: Asia/Shanghai
+      PDF2ZH_DATA_ROOT: /data/jobs
+      PDF2ZH_WORKER_TOKEN_FILE: /run/pdf2zh-secrets/token
+      PDF2ZH_PUBLIC_WORKER_MODE: "1"
+      PDF2ZH_MAX_ACTIVE_JOBS: "1"
+      PDF2ZH_WORKER_JOB_RETENTION_SECONDS: "${PDF2ZH_WORKER_JOB_RETENTION_SECONDS:-21600}"
+      PDF2ZH_WORKER_MAX_JOURNAL_EVENTS: "10000"
+      PDF2ZH_CANCEL_HARD_TIMEOUT_SECONDS: "${PDF2ZH_CANCEL_HARD_TIMEOUT_SECONDS:-75}"
+      PDF2ZH_SUPERVISOR_FAILURE_LIMIT: "${PDF2ZH_SUPERVISOR_FAILURE_LIMIT:-18}"
+      PDF2ZH_SUPERVISOR_CHILD_STOP_SECONDS: "${PDF2ZH_SUPERVISOR_CHILD_STOP_SECONDS:-45}"
+    volumes:
+      - ./data/jobs:/data/jobs
+      - ./secrets/worker:/run/pdf2zh-secrets:ro
+    networks:
+      - worker
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import json,urllib.request;
+          token=open('/run/pdf2zh-secrets/token',encoding='utf-8').read().rstrip('\\r\\n');
+          r=urllib.request.Request('http://127.0.0.1:8000/internal/health',headers={'x-worker-token':token});
+          p=json.load(urllib.request.urlopen(r,timeout=3));
+          assert p['status']=='ok' and p['provider']=='google' and p['max_active_jobs']==1 and p['epoch'] and p['container_boot_id']"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  web:
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-web:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 360s
+    mem_limit: 1g
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    expose:
+      - "7860"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      translator:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      PORT: "7860"
+      PDF2ZH_DATA_ROOT: /data/jobs
+      PDF2ZH_STATE_ROOT: /data/state
+      PDF2ZH_FRONTEND_DIR: /app/frontend
+      PDF2ZH_WORKER_URL: http://translator:8000
+      PDF2ZH_WORKER_TOKEN_FILE: /run/pdf2zh-secrets/worker-token
+      PDF2ZH_PUBLIC_IP: *public-ip
+      PDF2ZH_PUBLIC_PORT: *public-port
+      PDF2ZH_SECURE_COOKIES: "true"
+      PDF2ZH_TRUST_X_FORWARDED_FOR: "true"
+      PDF2ZH_MASTER_KEY_FILE: /run/pdf2zh-secrets/provider-master-key
+      PDF2ZH_SETUP_TOKEN_FILE: /run/pdf2zh-secrets/admin-setup-token
+      PDF2ZH_CONCURRENCY: "1"
+      PDF2ZH_MAX_ACTIVE_JOBS: "1"
+      PDF2ZH_MAX_UPLOAD_BYTES: "104857600"
+      PDF2ZH_UPLOAD_TIMEOUT_SECONDS: "${PDF2ZH_UPLOAD_TIMEOUT_SECONDS:-300}"
+      PDF2ZH_LEASE_SECONDS: "${PDF2ZH_LEASE_SECONDS:-180}"
+      PDF2ZH_RELEASE_GRACE_SECONDS: "${PDF2ZH_RELEASE_GRACE_SECONDS:-15}"
+      PDF2ZH_CANCEL_RECONCILE_SECONDS: "${PDF2ZH_CANCEL_RECONCILE_SECONDS:-120}"
+      PDF2ZH_WORKER_RECYCLE_SECONDS: "${PDF2ZH_WORKER_RECYCLE_SECONDS:-180}"
+      PDF2ZH_TERMINAL_RETENTION_SECONDS: "21600"
+      PDF2ZH_ID_TOMBSTONE_SECONDS: "${PDF2ZH_ID_TOMBSTONE_SECONDS:-21600}"
+    volumes:
+      - ./data/jobs:/data/jobs
+      - ./data/state:/data/state
+      - ./secrets/web:/run/pdf2zh-secrets:ro
+    networks:
+      - edge
+      - worker
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:7860/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+
+  gateway:
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-gateway:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
+    init: true
+    restart: unless-stopped
+    ports:
+      - target: 80
+        published: "80"
+        host_ip: "${PDF2ZH_BIND_ADDRESS:-0.0.0.0}"
+        protocol: tcp
+      - target: 7860
+        published: *public-port
+        host_ip: "${PDF2ZH_BIND_ADDRESS:-0.0.0.0}"
+        protocol: tcp
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      web:
+        condition: service_healthy
+    environment:
+      PDF2ZH_PUBLIC_IP: *public-ip
+      PDF2ZH_PORT: *public-port
+      PDF2ZH_NGINX_RELOAD_SECONDS: "${PDF2ZH_NGINX_RELOAD_SECONDS:-60}"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - NET_BIND_SERVICE
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    volumes:
+      - ./tls/active:/etc/pdf2zh-tls:ro
+      - ./tls/acme:/var/www/certbot:ro
+    networks:
+      - edge
+      - acme
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pdf2zh-gateway-health"]
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 15s
+
+  certbot:
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-ops:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
+    init: true
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/pdf2zh-certbot-loop"]
+    command: []
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      gateway:
+        condition: service_healthy
+    environment:
+      PDF2ZH_PUBLIC_IP: *public-ip
+      LETSENCRYPT_EMAIL: "${LETSENCRYPT_EMAIL:-}"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    volumes:
+      - ./data/certbot:/var/lib/letsencrypt
+      - ./tls/active:/run/pdf2zh-active-tls
+      - ./tls/letsencrypt:/etc/letsencrypt
+      - ./tls/acme:/var/www/certbot
+    networks:
+      - acme
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pdf2zh-certbot-health"]
+      interval: 30s
+      timeout: 10s
+      retries: 4
+      start_period: 5m
+
+networks:
+  edge:
+  worker:
+  acme:
+```
+<!-- END PORTABLE COMPOSE -->
+
 The first start creates `data/`, `secrets/`, and `tls/` beside the Compose
 file, requests the trusted short-lived IP certificate, and enables automatic
 renewal. Read the one-time administrator claim token locally on the server,
