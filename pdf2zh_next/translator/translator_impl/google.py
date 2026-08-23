@@ -14,6 +14,7 @@ from tenacity import stop_after_attempt
 from tenacity import wait_exponential
 
 logger = logging.getLogger(__name__)
+GOOGLE_REQUEST_TIMEOUT = (10, 30)
 
 
 def remove_control_characters(s):
@@ -48,6 +49,7 @@ class GoogleTranslator(BaseTranslator):
             self.endpoint,
             params={"tl": self.lang_out, "sl": self.lang_in, "q": text},
             headers=self.headers,
+            timeout=GOOGLE_REQUEST_TIMEOUT,
         )
         re_result = re.findall(
             r'(?s)class="(?:t0|result-container)">(.*?)<', response.text

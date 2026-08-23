@@ -4,10 +4,15 @@ import logging.handlers
 import multiprocessing
 import multiprocessing.connection
 import multiprocessing.queues
+import os
 import queue
+import signal
+import sys
 import threading
+import time
 import traceback
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from functools import partial
 from logging.handlers import QueueHandler
 from pathlib import Path
@@ -24,7 +29,6 @@ from rich.logging import RichHandler
 from pdf2zh_next.config.model import SettingsModel
 from pdf2zh_next.translator import get_term_translator
 from pdf2zh_next.translator import get_translator
-from pdf2zh_next.utils import asynchronize
 
 
 # Custom exception classes for structured error handling
@@ -114,9 +118,19 @@ def _translate_wrapper(
     pipe_progress_send: multiprocessing.connection.Connection,
     pipe_cancel_message_recv: multiprocessing.connection.Connection,
     logger_queue: multiprocessing.Queue,
+    process_group_id,
 ):
+    # A dedicated process group lets the parent remove BabelDOC descendants
+    # (font/PDF helper processes) when cooperative cancellation times out.
+    if os.name == "posix":
+        try:
+            os.setsid()
+            process_group_id.value = os.getpgrp()
+        except OSError:
+            pass
     logger = logging.getLogger(__name__)
     cancel_event = threading.Event()
+    queue_handler = None
     try:
         logging.getLogger("asyncio").setLevel(logging.WARNING)
         logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -140,7 +154,6 @@ def _translate_wrapper(
             try:
                 import joblib.externals.loky.backend.context as _loky_ctx
                 if _loky_ctx.physical_cores_cache is None:
-                    import os
                     _loky_ctx.physical_cores_cache = os.cpu_count()
                     logger.info(
                         "Pre-filled loky physical_cores_cache=%d to prevent "
@@ -161,6 +174,8 @@ def _translate_wrapper(
                 logger.debug("Cancel signal received in subprocess")
                 cancel_event.set()
                 config.cancel_translation()
+            except (EOFError, OSError):
+                return
             except Exception as e:
                 logger.error(f"Error in cancel_recv_thread: {e}")
 
@@ -326,7 +341,8 @@ def _translate_wrapper(
                 logger.error(f"Error closing progress pipe: {e}")
 
         try:
-            logging.getLogger().removeHandler(queue_handler)
+            if queue_handler is not None:
+                logging.getLogger().removeHandler(queue_handler)
             logging.getLogger().addHandler(RichHandler())
             logger_queue.put(None)
             logger_queue.close()
@@ -335,186 +351,373 @@ def _translate_wrapper(
                 logger.error(f"Error closing logger queue: {e}")
 
 
+def _signal_process_tree(
+    translate_process: multiprocessing.Process,
+    *,
+    force: bool,
+    process_group_id: int | None = None,
+) -> None:
+    """Signal a worker and, on POSIX, every descendant in its private group."""
+    if translate_process.pid is None:
+        return
+    if os.name == "posix":
+        try:
+            process_group = process_group_id or os.getpgid(translate_process.pid)
+            # Never signal a group unless the worker is its leader.  This guard
+            # prevents an early-cancel race from touching the server's group.
+            if process_group == translate_process.pid:
+                os.killpg(process_group, signal.SIGKILL if force else signal.SIGTERM)
+                return
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        if force:
+            translate_process.kill()
+        else:
+            translate_process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def _process_group_is_alive(process_group_id: int | None) -> bool:
+    if os.name != "posix" or not process_group_id:
+        return False
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _wait_for_process_group_exit(
+    process_group_id: int | None, timeout: float
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while _process_group_is_alive(process_group_id):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 async def _translate_in_subprocess(
     settings: SettingsModel,
     file: Path,
 ):
-    # 30 minutes timeout
-    cb = asynchronize.AsyncCallback(timeout=30 * 60)
+    """Translate in a spawn worker and reclaim it before publishing ``finish``."""
+    ctx = multiprocessing.get_context("spawn")
+    loop = asyncio.get_running_loop()
+    progress_messages: asyncio.Queue = asyncio.Queue()
+    progress_pipe_closed = object()
+    receiver_stop = threading.Event()
+    log_stop = threading.Event()
 
-    (pipe_progress_recv, pipe_progress_send) = multiprocessing.Pipe(duplex=False)
-    (pipe_cancel_message_recv, pipe_cancel_message_send) = multiprocessing.Pipe(
-        duplex=False
-    )
-    logger_queue = multiprocessing.Queue()
-    cancel_event = threading.Event()
+    pipe_progress_recv = None
+    pipe_progress_send = None
+    pipe_cancel_message_recv = None
+    pipe_cancel_message_send = None
+    logger_queue = None
+    translate_process = None
+    process_group_id = None
+    recv_t = None
+    log_t = None
+    process_started = False
+    finish_event = None
+    finish_received_at = None
+    terminal_error: TranslationError | None = None
+    cleanup_error: TranslationError | None = None
+    expected_stop = False
+    exit_code = None
 
-    def recv_thread():
-        while True:
-            if cancel_event.is_set():
-                break
+    def post_progress(message) -> bool:
+        try:
+            loop.call_soon_threadsafe(progress_messages.put_nowait, message)
+            return True
+        except RuntimeError:
+            return False
+
+    def recv_thread() -> None:
+        while not receiver_stop.is_set():
             try:
-                event = pipe_progress_recv.recv()
-                if event is None:
-                    logger.debug("recv none event")
-                    cb.finished_callback_without_args()
-                    break
-
-                # Handle different types of messages from the subprocess
-                if isinstance(event, TranslationError):
-                    # Received a structured error object
-                    logger.error(f"Received error from subprocess: {event}")
-                    cb.error_callback(event)
-                    break
-                elif isinstance(event, dict):
-                    # Process normal progress events
-                    cb.step_callback(event)
-                else:
-                    # Unexpected message type
-                    logger.warning(
-                        f"Unexpected message type from subprocess: {type(event)}"
-                    )
-                    error = IPCError(f"Unexpected message type: {type(event)}")
-                    cb.error_callback(error)
-                    break
+                message = pipe_progress_recv.recv()
             except EOFError:
-                logger.debug("recv eof error")
-                error = IPCError("Connection to subprocess was closed unexpectedly")
-                cb.error_callback(error)
+                post_progress(progress_pipe_closed)
                 break
-            except Exception as e:
-                if not cancel_event.is_set():
-                    logger.error(f"Error receiving event: {e}")
-                error = IPCError(f"IPC error: {e}", details=str(e))
-                cb.error_callback(error)
+            except (OSError, ValueError) as exc:
+                if not receiver_stop.is_set():
+                    post_progress(IPCError(f"IPC error: {exc}", details=str(exc)))
+                break
+            except Exception as exc:
+                if not receiver_stop.is_set():
+                    post_progress(IPCError(f"IPC error: {exc}", details=str(exc)))
+                break
+            if not post_progress(message) or message is None:
                 break
 
-    def log_thread():
-        while True:
+    def log_thread() -> None:
+        while not log_stop.is_set():
             try:
-                record = logger_queue.get()
-                if record is None:
-                    logger.info("Listener stopped.")
-                    break
-                logger.handle(record)
-            except KeyboardInterrupt:
-                logger.info("Listener stopped.")
-                break
+                record = logger_queue.get(timeout=0.2)
             except queue.Empty:
-                logger.info("Listener stopped.")
+                continue
+            except (EOFError, OSError, ValueError):
                 break
             except Exception:
-                logger.error("Failure in listener_process")
+                logger.exception("Failure in translation log listener")
+                break
+            if record is None:
+                break
+            try:
+                logger.handle(record)
+            except Exception:
+                logger.exception("Failure handling a translation log record")
                 break
 
-    recv_t = threading.Thread(target=recv_thread)
-    recv_t.start()
-    log_t = threading.Thread(target=log_thread)
-    log_t.start()
-
-    translate_process = multiprocessing.Process(
-        target=_translate_wrapper,
-        args=(
-            settings,
-            file,
-            pipe_progress_send,
-            pipe_cancel_message_recv,
-            logger_queue,
-        ),
-    )
-    translate_process.start()
-    cancel_flag = False
     try:
-        async for event in cb:
-            # Check for errors before yielding events
-            if cb.has_error():
-                # Let AsyncCallback.__anext__ raise the error
-                # This will break out of the loop
+        pipe_progress_recv, pipe_progress_send = ctx.Pipe(duplex=False)
+        pipe_cancel_message_recv, pipe_cancel_message_send = ctx.Pipe(duplex=False)
+        logger_queue = ctx.Queue()
+        process_group_id = ctx.Value("q", 0)
+        translate_process = ctx.Process(
+            target=_translate_wrapper,
+            args=(
+                settings,
+                file,
+                pipe_progress_send,
+                pipe_cancel_message_recv,
+                logger_queue,
+                process_group_id,
+            ),
+        )
+        translate_process.start()
+        process_started = True
+
+        # The parent must close every child-owned endpoint.  Keeping the
+        # progress writer open makes EOF impossible after a worker crash.
+        pipe_progress_send.close()
+        pipe_progress_send = None
+        pipe_cancel_message_recv.close()
+        pipe_cancel_message_recv = None
+
+        recv_t = threading.Thread(
+            target=recv_thread, name="pdf2zh-progress-listener", daemon=True
+        )
+        recv_t.start()
+        log_t = threading.Thread(
+            target=log_thread, name="pdf2zh-log-listener", daemon=True
+        )
+        log_t.start()
+
+        worker_dead_at = None
+        last_message_at = time.monotonic()
+        while True:
+            try:
+                message = await asyncio.wait_for(progress_messages.get(), timeout=0.2)
+                last_message_at = time.monotonic()
+            except TimeoutError:
+                if (
+                    finish_received_at is not None
+                    and time.monotonic() - finish_received_at >= 10
+                ):
+                    logger.warning(
+                        "Translation worker did not close its IPC channel after finish"
+                    )
+                    break
+                if time.monotonic() - last_message_at > 30 * 60:
+                    terminal_error = IPCError(
+                        "Translation subprocess produced no event for 30 minutes"
+                    )
+                    break
+                if not translate_process.is_alive():
+                    worker_dead_at = worker_dead_at or time.monotonic()
+                    # Give the receiver a bounded chance to drain messages that
+                    # were written immediately before the process sentinel.
+                    if time.monotonic() - worker_dead_at >= 1.0:
+                        if finish_event is None and terminal_error is None:
+                            code = translate_process.exitcode
+                            if code not in (0, None):
+                                terminal_error = SubprocessCrashError(
+                                    "Translation subprocess exited without a final event",
+                                    exit_code=code,
+                                )
+                            else:
+                                terminal_error = IPCError(
+                                    "Translation subprocess exited without a finish event"
+                                )
+                        break
+                else:
+                    worker_dead_at = None
+                continue
+
+            if message is progress_pipe_closed or message is None:
+                if finish_event is None and terminal_error is None:
+                    code = translate_process.exitcode
+                    if code not in (0, None):
+                        terminal_error = SubprocessCrashError(
+                            "Translation subprocess closed its IPC channel unexpectedly",
+                            exit_code=code,
+                        )
+                    else:
+                        terminal_error = IPCError(
+                            "Translation subprocess closed without a finish event"
+                        )
                 break
-            yield event.args[0]
+            if isinstance(message, TranslationError):
+                terminal_error = message
+                break
+            if not isinstance(message, dict):
+                terminal_error = IPCError(
+                    f"Unexpected message type from subprocess: {type(message)}"
+                )
+                break
+            if message.get("type") == "finish":
+                finish_event = message
+                finish_received_at = time.monotonic()
+                # The child follows with an explicit pipe sentinel.  Do not
+                # expose finish until the finally block has joined the worker.
+                continue
+            if finish_event is not None:
+                terminal_error = IPCError("Received progress after the finish event")
+                break
+            yield message
     except asyncio.CancelledError:
-        cancel_flag = True
+        expected_stop = True
         logger.info("Process Translation cancelled")
         raise
+    except GeneratorExit:
+        expected_stop = True
+        raise
     except KeyboardInterrupt:
+        expected_stop = True
         logger.info("KeyboardInterrupt received in main process")
+        raise
     finally:
-        logger.debug("send cancel message")
-        try:
-            pipe_cancel_message_send.send(True)
-        except (OSError, BrokenPipeError) as e:
-            logger.debug(f"Failed to send cancel message: {e}")
-        logger.debug("close pipe cancel message")
-        try:
-            pipe_cancel_message_send.close()
-        except Exception as e:
-            logger.debug(f"Failed to close pipe_cancel_message_send: {e}")
+        active_exception = sys.exc_info()[0] is not None
 
-        try:
-            pipe_progress_send.send(None)
-        except (OSError, BrokenPipeError) as e:
-            logger.debug(f"Failed to send None to pipe_progress_send: {e}")
-
-        logger.debug("set cancel event")
-        cancel_event.set()
-
-        # 关闭接收端管道以中断 recv_thread 中的阻塞接收
-        try:
-            pipe_progress_recv.close()
-            logger.debug("closed pipe_progress_recv")
-        except Exception as e:
-            logger.debug(f"Failed to close pipe_progress_recv: {e}")
-
-        # 终止子进程，使用超时防止卡住
-        translate_process.join(timeout=2)
-        logger.debug("join translate process")
-        if translate_process.is_alive():
-            logger.info("Translate process did not finish in time, terminate it")
-            translate_process.terminate()
-            translate_process.join(timeout=1)
-        if translate_process.is_alive():
-            logger.info("Translate process did not finish in time, killing it")
+        # Cooperative cancellation first.  It invokes BabelDOC's own cancel
+        # hook and normally releases caches and temporary files cleanly.
+        if process_started and translate_process.is_alive() and finish_event is None:
             try:
-                translate_process.kill()
-                translate_process.join(timeout=1)
-                logger.info("Translate process killed")
-            except Exception as e:
-                logger.exception(f"Error killing translate process: {e}")
+                pipe_cancel_message_send.send(True)
+            except (OSError, BrokenPipeError, EOFError):
+                pass
+        if pipe_cancel_message_send is not None:
+            try:
+                pipe_cancel_message_send.close()
+            except (OSError, ValueError):
+                pass
+            pipe_cancel_message_send = None
 
-        # 等待接收线程，使用超时防止卡住
-        logger.debug("join recv thread")
-        recv_t.join(timeout=2)
-        if recv_t.is_alive():
-            logger.warning("Recv thread did not finish in time")
-
-        # 等待日志线程，使用超时防止卡住
-        log_t.join(timeout=1)
-        if log_t.is_alive():
-            logger.warning("Log thread did not finish in time")
-
-        # 尝试关闭日志队列
-        try:
-            logger_queue.put(None)
-            logger_queue.close()
-        except Exception as e:
-            logger.debug(f"Failed to close logger_queue: {e}")
-
-        logger.debug("translate process exit code: %s", translate_process.exitcode)
-        if not cancel_flag:
-            # Check if the process crashed but no error was captured through IPC
-            if translate_process.exitcode not in (0, None) and not cb.has_error():
-                error = SubprocessCrashError(
-                    f"Translation subprocess crashed with exit code {translate_process.exitcode}",
-                    exit_code=translate_process.exitcode,
+        if process_started:
+            try:
+                translate_process.join(timeout=5 if finish_event is not None else 3)
+                worker_group = (
+                    int(process_group_id.value) if process_group_id is not None else 0
                 )
-                # We need to raise the error as we're outside the async for loop now
-                raise error
-            elif cb.has_error():
-                # If we have a stored error but haven't raised it yet (exited the loop normally)
-                # re-raise it now
-                # Note: In most cases, this won't execute because the error would already have been
-                # raised by AsyncCallback.__anext__
-                raise cb.error
+                if translate_process.is_alive() or _process_group_is_alive(worker_group):
+                    logger.warning(
+                        "Translation worker tree did not stop; terminating its group"
+                    )
+                    _signal_process_tree(
+                        translate_process,
+                        force=False,
+                        process_group_id=worker_group,
+                    )
+                    translate_process.join(timeout=2)
+                    _wait_for_process_group_exit(worker_group, timeout=2)
+                # The leader often exits before a TERM-resistant descendant.
+                # Check the cached process group independently of leader state.
+                if translate_process.is_alive() or _process_group_is_alive(worker_group):
+                    logger.warning("Translation worker group still alive; killing it")
+                    _signal_process_tree(
+                        translate_process,
+                        force=True,
+                        process_group_id=worker_group,
+                    )
+                    translate_process.join(timeout=1)
+                    _wait_for_process_group_exit(worker_group, timeout=1)
+                if translate_process.is_alive() or _process_group_is_alive(worker_group):
+                    cleanup_error = SubprocessCrashError(
+                        "Could not stop translation subprocess tree", exit_code=None
+                    )
+                exit_code = translate_process.exitcode
+            except Exception:
+                logger.exception("Failed while stopping translation subprocess")
+                if not active_exception:
+                    cleanup_error = IPCError("Failed to stop translation subprocess")
+
+        # A dead worker closes its writer and wakes the receiver.  Only after a
+        # bounded join do we close the reader from this thread.
+        receiver_stop.set()
+        if recv_t is not None:
+            recv_t.join(timeout=1)
+        if pipe_progress_recv is not None:
+            try:
+                pipe_progress_recv.close()
+            except (OSError, ValueError):
+                pass
+            pipe_progress_recv = None
+        if recv_t is not None and recv_t.is_alive():
+            recv_t.join(timeout=0.2)
+            if recv_t.is_alive():
+                logger.warning("Progress listener did not stop within the cleanup bound")
+
+        # The child normally sends the log sentinel.  If it was killed, the
+        # stop event releases get(timeout=...) without the parent ever writing
+        # into a possibly broken multiprocessing queue.
+        log_stop.set()
+        if log_t is not None:
+            log_t.join(timeout=1)
+            if log_t.is_alive():
+                logger.warning("Log listener did not stop within the cleanup bound")
+        if logger_queue is not None:
+            try:
+                logger_queue.cancel_join_thread()
+            except (AttributeError, OSError, ValueError):
+                pass
+            try:
+                logger_queue.close()
+            except (OSError, ValueError):
+                pass
+            logger_queue = None
+
+        for connection in (pipe_progress_send, pipe_cancel_message_recv):
+            if connection is not None:
+                try:
+                    connection.close()
+                except (OSError, ValueError):
+                    pass
+
+        if translate_process is not None:
+            try:
+                translate_process.close()
+            except ValueError:
+                logger.warning("Could not close a still-running translation process")
+
+        logger.debug("Translation worker exit code: %s", exit_code)
+
+        # Cleanup must never replace cancellation, GeneratorExit, timeout, or
+        # another exception already propagating from the consumer.
+        if active_exception or expected_stop:
+            cleanup_error = None
+
+    if cleanup_error is not None:
+        raise cleanup_error
+    if terminal_error is not None:
+        raise terminal_error
+    if finish_event is None:
+        if exit_code not in (0, None):
+            raise SubprocessCrashError(
+                "Translation subprocess exited without a finish event",
+                exit_code=exit_code,
+            )
+        raise IPCError("Translation subprocess exited without a finish event")
+
+    # This is deliberately the final suspension point: all process, pipe and
+    # queue cleanup above has completed before callers observe success.
+    yield finish_event
 
 
 def _get_glossaries(settings: SettingsModel) -> list[Glossary] | None:
@@ -659,12 +862,13 @@ async def do_translate_async_stream(
         logger.info("translate in subprocess")
 
     try:
-        async for event in translate_func():
-            yield event
-            if settings.basic.debug:
-                logger.debug(event)
-            if event["type"] == "finish":
-                break
+        async with aclosing(translate_func()) as event_stream:
+            async for event in event_stream:
+                yield event
+                if settings.basic.debug:
+                    logger.debug(event)
+                if event["type"] == "finish":
+                    break
     except TranslationError as e:
         # Log and re-raise structured errors
         logger.error(f"Translation error: {e}")

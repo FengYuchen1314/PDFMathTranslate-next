@@ -1,0 +1,15 @@
+services:
+  pdf2zh:
+    build: ./app
+    image: pdf2zh-next-fixed:latest
+    container_name: pdf2zh-next
+    init: true
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./config:/root/.config/pdf2zh
+    environment:
+      TZ: Asia/Shanghai
+      PDF2ZH_LANG_IN: en
+      PDF2ZH_LANG_OUT: zh-CN

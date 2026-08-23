@@ -5,9 +5,12 @@ import io
 import logging
 import shutil
 import tempfile
+import threading
+import time
 import typing
 import uuid
 import zipfile
+from contextlib import aclosing
 from enum import Enum
 from pathlib import Path
 from string import Template
@@ -41,6 +44,13 @@ from pdf2zh_next.i18n import gettext as _
 from pdf2zh_next.i18n import update_current_languages
 
 logger = logging.getLogger(__name__)
+
+_active_translation_tasks: dict[str, asyncio.Task] = {}
+_session_run_dirs: dict[str, set[str]] = {}
+_active_translation_tasks_lock = threading.Lock()
+_OUTPUT_ROOT = Path("pdf2zh_files")
+_STALE_OUTPUT_MAX_AGE_SECONDS = 24 * 60 * 60
+_OUTPUT_SWEEP_INTERVAL_SECONDS = 15 * 60
 
 
 class SaveMode(Enum):
@@ -310,19 +320,10 @@ for display_name, code in lang_map.items():
 else:
     default_lang_to = "Simplified Chinese"  # Fallback
 
-# Available translation services
-# This will eventually be dynamically determined based on available translators
-available_services = [x.translate_engine_type for x in TRANSLATION_ENGINE_METADATA]
-
-if settings.gui_settings.enabled_services:
-    enabled_services = {
-        x.lower() for x in settings.gui_settings.enabled_services.split(",")
-    }
-    available_services = [
-        x for x in available_services if x.lower() in enabled_services
-    ]
-
-assert available_services, "No translation service is enabled"
+# This deployment deliberately exposes only Google.  Do this in code rather
+# than relying on a mutable user configuration so an old config cannot bring
+# back another provider after a restart.
+available_services = ["Google"]
 
 
 disable_gui_sensitive_input = settings.gui_settings.disable_gui_sensitive_input
@@ -682,7 +683,8 @@ def _build_translate_settings(
     if rpc_doclayout:
         translate_settings.translation.rpc_doclayout = rpc_doclayout
 
-    # UI uses positive switch, config uses negative flag, so we invert here
+    # The Google-only UI fixes this switch off.  Preserve the normal conversion
+    # here so direct library callers and saved-config round trips remain valid.
     if enable_auto_term_extraction is not None:
         translate_settings.translation.no_auto_extract_glossary = (
             not enable_auto_term_extraction
@@ -1050,6 +1052,195 @@ def build_ui_inputs(*args):
     return ui_inputs
 
 
+def _translation_session_key(request: gr.Request | None, state: dict | None) -> str | None:
+    if request is not None and request.session_hash:
+        return request.session_hash
+    if state:
+        return state.get("session_id")
+    return None
+
+
+def _register_translation_task(
+    request: gr.Request | None, state: dict, task: asyncio.Task
+) -> None:
+    session_key = _translation_session_key(request, state)
+    if session_key:
+        with _active_translation_tasks_lock:
+            _active_translation_tasks[session_key] = task
+
+        # The registry is the fallback used when a tab refresh destroys Gradio
+        # State before the unload callback arrives.  Keep the entry until the
+        # request has *actually* finished its subprocess cleanup.
+        def remove_completed_task(completed_task: asyncio.Task) -> None:
+            with _active_translation_tasks_lock:
+                if _active_translation_tasks.get(session_key) is completed_task:
+                    _active_translation_tasks.pop(session_key, None)
+
+        task.add_done_callback(remove_completed_task)
+
+
+def _unregister_translation_task(
+    request: gr.Request | None, state: dict, task: asyncio.Task | None
+) -> None:
+    if task is None:
+        return
+    session_key = _translation_session_key(request, state)
+    if session_key:
+        with _active_translation_tasks_lock:
+            if _active_translation_tasks.get(session_key) is task:
+                _active_translation_tasks.pop(session_key, None)
+
+
+def _track_session_run_directory(
+    request: gr.Request | None, state: dict, run_dir: Path
+) -> None:
+    session_key = _translation_session_key(request, state)
+    if session_key:
+        with _active_translation_tasks_lock:
+            _session_run_dirs.setdefault(session_key, set()).add(str(run_dir))
+
+
+def _forget_session_run_directory(
+    request: gr.Request | None, state: dict, run_dir: str | Path
+) -> None:
+    session_key = _translation_session_key(request, state)
+    if not session_key:
+        return
+    with _active_translation_tasks_lock:
+        run_dirs = _session_run_dirs.get(session_key)
+        if run_dirs is None:
+            return
+        run_dirs.discard(str(run_dir))
+        if not run_dirs:
+            _session_run_dirs.pop(session_key, None)
+
+
+def _forget_run_directories_globally(run_dirs: list[str]) -> None:
+    if not run_dirs:
+        return
+    forgotten = set(run_dirs)
+    with _active_translation_tasks_lock:
+        for session_key, tracked_dirs in list(_session_run_dirs.items()):
+            tracked_dirs.difference_update(forgotten)
+            if not tracked_dirs:
+                _session_run_dirs.pop(session_key, None)
+
+
+def _remove_run_directory(run_dir: str | Path) -> None:
+    """Remove one UUID run directory without ever deleting the output root."""
+    try:
+        output_root = _OUTPUT_ROOT.resolve()
+        resolved = Path(run_dir).resolve()
+        if resolved.parent != output_root:
+            logger.warning("Refusing to remove unexpected run directory: %s", resolved)
+            return
+        shutil.rmtree(resolved, ignore_errors=True)
+    except Exception:
+        logger.exception("Failed to remove translation run directory: %s", run_dir)
+
+
+def _remove_run_directories(run_dirs: list[str]) -> None:
+    for run_dir in set(run_dirs):
+        _remove_run_directory(run_dir)
+
+
+def _cleanup_stale_output_directories() -> None:
+    """Reclaim old API-client/crash outputs while never touching active runs."""
+    output_root = _OUTPUT_ROOT.resolve()
+    if not output_root.exists():
+        return
+    with _active_translation_tasks_lock:
+        active_session_keys = {
+            key for key, task in _active_translation_tasks.items() if not task.done()
+        }
+        active_dirs = {
+            str(Path(run_dir).resolve())
+            for key in active_session_keys
+            for run_dir in _session_run_dirs.get(key, set())
+        }
+    cutoff = time.time() - _STALE_OUTPUT_MAX_AGE_SECONDS
+    removed: list[str] = []
+    for child in output_root.iterdir():
+        try:
+            if (
+                child.is_dir()
+                and str(child.resolve()) not in active_dirs
+                and child.stat().st_mtime < cutoff
+            ):
+                _remove_run_directory(child)
+                removed.append(str(child))
+        except OSError:
+            logger.debug("Could not inspect stale output directory: %s", child)
+    _forget_run_directories_globally(removed)
+
+
+def _output_sweeper() -> None:
+    while True:
+        time.sleep(_OUTPUT_SWEEP_INTERVAL_SECONDS)
+        try:
+            _cleanup_stale_output_directories()
+        except Exception:
+            # A transient filesystem error must not permanently disable the
+            # only long-lived cleanup worker.
+            logger.exception("Unexpected failure in stale output sweeper")
+
+
+threading.Thread(
+    target=_output_sweeper,
+    name="pdf2zh-output-sweeper",
+    daemon=True,
+).start()
+
+
+def _schedule_run_directory_cleanup(task: asyncio.Task | None, run_dirs: list[str]) -> None:
+    """Delete outputs after an active translation has released its file handles."""
+    if not run_dirs:
+        return
+    if task is None or task.done():
+        _remove_run_directories(run_dirs)
+        return
+
+    def cleanup_when_done(_completed_task: asyncio.Task) -> None:
+        # Avoid doing potentially slow filesystem work on the event loop.
+        threading.Thread(
+            target=_remove_run_directories,
+            args=(run_dirs,),
+            name="pdf2zh-output-cleanup",
+            daemon=True,
+        ).start()
+
+    try:
+        task.get_loop().call_soon_threadsafe(task.add_done_callback, cleanup_when_done)
+    except (RuntimeError, AttributeError):
+        _remove_run_directories(run_dirs)
+
+
+def cleanup_translation_session(state: dict | None) -> None:
+    """Cancel a deleted browser session and reclaim all of its output files."""
+    state = state or {}
+    task = state.get("current_task")
+    stop_translate_file(state)
+    run_dirs = list(state.get("run_dirs") or [])
+    state["run_dirs"] = []
+    _forget_run_directories_globally(run_dirs)
+    _schedule_run_directory_cleanup(task, run_dirs)
+
+
+def _drop_run_artifacts_from_state(state: dict, output_dir: Path) -> None:
+    """Discard state entries that point into a cancelled/failed run."""
+    output_dir = output_dir.resolve()
+    for mapping_name in ("display_map", "parent_map"):
+        mapping = state.get(mapping_name, {})
+        for key, value in list(mapping.items()):
+            try:
+                if Path(value).resolve().is_relative_to(output_dir):
+                    mapping.pop(key, None)
+            except (OSError, TypeError, ValueError):
+                continue
+    state["results"] = {}
+    state["file_order"] = []
+
+
 async def _run_translation_task(
     settings: SettingsModel,
     file_path: Path,
@@ -1077,38 +1268,37 @@ async def _run_translation_task(
 
     try:
         settings.basic.input_files = set()
-        async for event in do_translate_async_stream(settings, file_path):
-            if event["type"] in (
-                "progress_start",
-                "progress_update",
-                "progress_end",
-            ):
-                # Update progress bar
-                desc = event["stage"]
-                progress_value = event["overall_progress"] / 100.0
-                part_index = event["part_index"]
-                total_parts = event["total_parts"]
-                stage_current = event["stage_current"]
-                stage_total = event["stage_total"]
+        async with aclosing(do_translate_async_stream(settings, file_path)) as events:
+            async for event in events:
+                if event["type"] in (
+                    "progress_start",
+                    "progress_update",
+                    "progress_end",
+                ):
+                    # Update progress bar
+                    desc = event["stage"]
+                    progress_value = event["overall_progress"] / 100.0
+                    part_index = event["part_index"]
+                    total_parts = event["total_parts"]
+                    stage_current = event["stage_current"]
+                    stage_total = event["stage_total"]
 
-                # Combine task prefix with current status
-                full_desc = f"{task_prefix}{desc} ({part_index}/{total_parts}, {stage_current}/{stage_total})"
-                logger.info(f"Progress: {progress_value}, {full_desc}")
-                progress(progress_value, desc=full_desc)
-            elif event["type"] == "finish":
-                # Extract result paths
-                result = event["translate_result"]
-                mono_path = result.mono_pdf_path
-                dual_path = result.dual_pdf_path
-                glossary_path = result.auto_extracted_glossary_path
-                token_usage = event.get("token_usage", {})
-                # progress(1.0, desc=_("Translation complete!")) # Let caller handle final completion
-                break
-            elif event["type"] == "error":
-                # Handle error event
-                error_msg = event.get("error", "Unknown error")
-                error_details = event.get("details", "")
-                raise gr.Error(f"Translation error: {error_msg}")
+                    # Combine task prefix with current status
+                    full_desc = f"{task_prefix}{desc} ({part_index}/{total_parts}, {stage_current}/{stage_total})"
+                    logger.info(f"Progress: {progress_value}, {full_desc}")
+                    progress(progress_value, desc=full_desc)
+                elif event["type"] == "finish":
+                    # The subprocess stream withholds this terminal event until
+                    # its worker and IPC resources have all been reclaimed.
+                    result = event["translate_result"]
+                    mono_path = result.mono_pdf_path
+                    dual_path = result.dual_pdf_path
+                    glossary_path = result.auto_extracted_glossary_path
+                    token_usage = event.get("token_usage", {})
+                    break
+                elif event["type"] == "error":
+                    error_msg = event.get("error", "Unknown error")
+                    raise gr.Error(f"Translation error: {error_msg}")
     except asyncio.CancelledError:
         # Handle task cancellation - let translate_file handle the UI updates
         logger.info(
@@ -1118,7 +1308,7 @@ async def _run_translation_task(
     except TranslationError as e:
         # Handle structured translation errors
         logger.error(f"Translation error: {e}")
-        raise gr.Error(f"Translation error: {e.message}") from e
+        raise gr.Error(f"Translation error: {e}") from e
     except gr.Error as e:
         # Handle Gradio errors
         logger.error(f"Gradio error: {e}")
@@ -1131,7 +1321,9 @@ async def _run_translation_task(
     return mono_path, dual_path, glossary_path, token_usage
 
 
-async def stop_translate_file(state: dict) -> None:
+def stop_translate_file(
+    state: dict | None = None, request: gr.Request | None = None
+) -> dict:
     """
     This function stops the translation process.
 
@@ -1140,27 +1332,47 @@ async def stop_translate_file(state: dict) -> None:
 
     Returns:- None
     """
-    if "current_task" not in state or state["current_task"] is None:
-        return
+    state = state or {}
+    session_key = _translation_session_key(request, state)
+    with _active_translation_tasks_lock:
+        registered_task = (
+            _active_translation_tasks.get(session_key) if session_key else None
+        )
+    task = registered_task or state.get("current_task")
+    if task is None:
+        return state
 
     logger.info(
         f"Stopping translation for session {state.get('session_id', 'unknown')}"
     )
     # Cancel the task
     try:
-        state["current_task"].cancel()
-        # Wait briefly for cancellation to take effect
-        await asyncio.sleep(0.1)
+        # A queue=False Gradio event can run on another event loop.  Scheduling
+        # cancellation on the task's own loop keeps this safe in both cases.
+        task.get_loop().call_soon_threadsafe(task.cancel)
+        state["cancel_requested"] = True
     except Exception as e:
         logger.error(f"Error stopping translation: {e}")
-    finally:
-        state["current_task"] = None
+    # Do not drop the handle here.  The worker may still be unwinding IPC and
+    # killing descendants; its done callback/finally owns deregistration.
+    return state
+
+
+def stop_translation_on_unload(request: gr.Request) -> None:
+    """Cancel work owned by a browser session that is closing or refreshing."""
+    session_key = _translation_session_key(request, None)
+    with _active_translation_tasks_lock:
+        task = _active_translation_tasks.get(session_key) if session_key else None
+        run_dirs = list(_session_run_dirs.pop(session_key, set())) if session_key else []
+    stop_translate_file(request=request)
+    _schedule_run_directory_cleanup(task, run_dirs)
 
 
 async def translate_files(
     file_type,
     file_input,
     link_input,
+    request: gr.Request,
     *ui_args,
     progress=None,
 ):
@@ -1171,6 +1383,12 @@ async def translate_files(
     if progress is None:
         progress = gr.Progress()
 
+    task: asyncio.Task | None = None
+    outer_task = asyncio.current_task()
+    if outer_task is None:
+        raise RuntimeError("Translation must run inside an asyncio task")
+    keep_output = False
+
     # Build ui_inputs from *args
     ui_inputs = build_ui_inputs(*ui_args)
     state = ui_inputs["state"]
@@ -1178,6 +1396,16 @@ async def translate_files(
     # Initialize session and output directory
     session_id = str(uuid.uuid4())
     state["session_id"] = session_id
+    state["current_task"] = outer_task
+    state["worker_task"] = None
+    state["cancel_requested"] = False
+    _register_translation_task(request, state, outer_task)
+    previous_run_dirs = list(state.get("run_dirs") or [])
+    for previous_run_dir in previous_run_dirs:
+        _drop_run_artifacts_from_state(state, Path(previous_run_dir))
+        _forget_session_run_directory(request, state, previous_run_dir)
+    _remove_run_directories(previous_run_dirs)
+    state["run_dirs"] = []
     # Reset results for new translation run, but keep display_map for uploaded files
     state["results"] = {}
     state["file_order"] = []
@@ -1189,8 +1417,16 @@ async def translate_files(
         state["parent_map"] = {}
 
     # Prepare output directory
-    output_dir = Path("pdf2zh_files") / session_id
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _OUTPUT_ROOT / session_id
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        _unregister_translation_task(request, state, outer_task)
+        if state.get("current_task") is outer_task:
+            state["current_task"] = None
+        raise
+    state.setdefault("run_dirs", []).append(str(output_dir))
+    _track_session_run_directory(request, state, output_dir)
 
     zip_path = output_dir / "all_translations.zip"
     zip_mono_path = output_dir / "all_mono_translations.zip"
@@ -1293,10 +1529,14 @@ async def translate_files(
                     task_prefix=task_prefix,
                 )
             )
-            state["current_task"] = task
+            state["worker_task"] = task
 
             # Await result
-            mono_path, dual_path, glossary_path, token_usage = await task
+            try:
+                mono_path, dual_path, glossary_path, token_usage = await task
+            finally:
+                if state.get("worker_task") is task:
+                    state["worker_task"] = None
 
             # Store results
             result_entry = {
@@ -1334,21 +1574,6 @@ async def translate_files(
                             "cache_hit_prompt", 0
                         )
                         all_token_usage["completion"] += u.get("completion", 0)
-
-            # YIELD UPDATE: Update the UI immediately after this file is done
-            # Select the Dual version of the current file to show progress visually
-            current_preview_label = filename
-            if result_entry["dual"]:
-                current_preview_label = (
-                    f"{Path(filename).stem}_dual{Path(filename).suffix}"
-                )
-            elif result_entry["mono"]:
-                current_preview_label = (
-                    f"{Path(filename).stem}_mono{Path(filename).suffix}"
-                )
-
-            # Generate the intermediate UI update
-            yield get_current_ui_update(current_preview_label)
 
         # Step 3: Finalize (Create Zips)
         # All files zip
@@ -1437,6 +1662,7 @@ async def translate_files(
             uploaded_view_update = gr.update(value="", visible=False)
 
         # Yield Final Result with Zips visible
+        keep_output = True
         yield (
             final_mono,
             final_preview_path,
@@ -1461,33 +1687,28 @@ async def translate_files(
 
     except asyncio.CancelledError:
         gr.Info(_("Translation cancelled"))
-        state["uploaded_files"] = []
-        yield (
-            None,
-            None,
-            None,
-            None,
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(choices=[], value=None, visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            None,
-            gr.update(visible=False),
-            None,
-            gr.update(visible=False),
-            None,
-            gr.update(visible=False),
-            None,
-            gr.update(value="", visible=False),
-        )
+        logger.info("Translation request %s was cancelled", session_id)
+        raise
     except Exception as e:
         logger.exception(f"Error in translate_files: {e}")
         raise gr.Error(f"Translation failed: {e}") from e
     finally:
-        state["current_task"] = None
+        if not keep_output:
+            _drop_run_artifacts_from_state(state, output_dir)
+            _remove_run_directory(output_dir)
+            _forget_session_run_directory(request, state, output_dir)
+            run_dirs = state.get("run_dirs", [])
+            state["run_dirs"] = [
+                path for path in run_dirs if Path(path) != output_dir
+            ]
+        _unregister_translation_task(request, state, outer_task)
+        # Do not erase a task started after an old request was cancelled.
+        if (
+            state.get("session_id") == session_id
+            and state.get("current_task") is outer_task
+        ):
+            state["current_task"] = None
+            state["worker_task"] = None
 
 
 def swap_languages(lang_from_value, lang_to_value):
@@ -1680,13 +1901,8 @@ def on_file_clear(_files, state):
 
     # Cancel any ongoing translation task
     if "current_task" in state and state["current_task"] is not None:
-        try:
-            state["current_task"].cancel()
-            logger.info("Translation task cancelled due to file clear")
-        except Exception as e:
-            logger.error(f"Error cancelling translation task: {e}")
-        finally:
-            state["current_task"] = None
+        stop_translate_file(state)
+        logger.info("Translation task cancelled due to file clear")
 
     # Get list of uploaded files to remove
     uploaded_files_to_remove = list(state["uploaded_files"])
@@ -1769,13 +1985,8 @@ def on_file_input_change(files, state, selected_label):
 
     # If something was removed while translating, cancel to avoid processing stale inputs.
     if removed and state.get("current_task") is not None:
-        try:
-            state["current_task"].cancel()
-            logger.info("Translation task cancelled due to per-file removal")
-        except Exception as e:
-            logger.error(f"Error cancelling translation task: {e}")
-        finally:
-            state["current_task"] = None
+        stop_translate_file(state)
+        logger.info("Translation task cancelled due to per-file removal")
 
     # Remove deleted originals from display_map/parent_map
     for name in removed:
@@ -2355,12 +2566,9 @@ custom_css = """
 
 # Build paths to resources
 current_dir = Path(__file__).parent
-assets_dir = current_dir / "assets"
-logo_path = assets_dir / "powered_by_siliconflow_light.png"
 translation_file_path = current_dir / "gui_translation.yaml"
 config_fake_pdf_path = DEFAULT_CONFIG_DIR / "config.fake.pdf"
 pdf_preview_allowed_paths = [
-    logo_path,
     Path("pdf2zh_files").resolve(),  # translation outputs
     Path(tempfile.gettempdir()).resolve(),  # uploaded temp files
 ]
@@ -2378,11 +2586,6 @@ tech_details_string = f"""
                     - GUI by: <a href="https://github.com/reycn">Rongxin</a> & <a href="https://github.com/hellofinch">hellofinch</a> & <a href="https://github.com/awwaawwa">awwaawwa</a> & <a href="https://github.com/zfb132">zfb132</a><br>
                     - pdf2zh Version: {__version__} <br>
                     - BabelDOC Version: {babeldoc_version}<br>
-                    - Free translation service provided by <a href="https://siliconflow.cn/" target="_blank" style="text-decoration: none;">SiliconFlow</a><br>
-                    <a href="https://siliconflow.cn/" target="_blank" style="text-decoration: none;">
-                        <img src="/gradio_api/file={logo_path}" alt="Powered By SiliconFlow" style="height: 40px; margin-top: 10px; background-color: #ffffff; padding: 4px; border-radius: 4px;">
-                    </a>
-                    <br>
                 """
 update_current_languages(settings.gui_settings.ui_lang)
 # The following code creates the GUI
@@ -2540,7 +2743,7 @@ with gr.Blocks(
                         _(
                             "Free translation service provided by [SiliconFlow](https://siliconflow.cn)"
                         ),
-                        visible=True,
+                        visible=False,
                     )
 
                     detail_index = 0
@@ -2737,21 +2940,21 @@ with gr.Blocks(
                         )
 
                     # Term extraction options (engine + rate limit + detail settings)
-                    with gr.Accordion(_("Auto Term Extraction"), open=True):
+                    with gr.Accordion(_("Auto Term Extraction"), open=False, visible=False):
                         enable_auto_term_extraction = gr.Checkbox(
                             label=_("Enable auto term extraction"),
-                            value=not settings.translation.no_auto_extract_glossary,
-                            interactive=True,
+                            value=False,
+                            interactive=False,
                         )
 
                         term_disabled_info = gr.Markdown(
                             _(
                                 "Auto term extraction is disabled. Term extraction settings below will not take effect until it is enabled."
                             ),
-                            visible=settings.translation.no_auto_extract_glossary,
+                            visible=True,
                         )
 
-                        with gr.Group(visible=True) as term_settings_group:
+                        with gr.Group(visible=False) as term_settings_group:
                             term_service = gr.Dropdown(
                                 label=_("Term extraction engine"),
                                 choices=[
@@ -2759,10 +2962,6 @@ with gr.Blocks(
                                         _("Follow main translation engine"),
                                         "Follow main translation engine",
                                     )
-                                ]
-                                + [
-                                    metadata.translate_engine_type
-                                    for metadata in TERM_EXTRACTION_ENGINE_METADATA
                                 ],
                                 value="Follow main translation engine",
                             )
@@ -3481,12 +3680,20 @@ with gr.Blocks(
             {
                 "session_id": None,
                 "current_task": None,
+                "worker_task": None,
+                "cancel_requested": False,
                 "results": {},
                 "file_order": [],
                 "display_map": {},
                 "parent_map": {},
                 "uploaded_files": [],
-            }
+                "run_dirs": [],
+            },
+            # Active sessions must not expire during a long translation.  The
+            # heartbeat unload hook performs immediate cleanup on disconnect;
+            # Gradio applies its own one-hour grace period after a closed tab.
+            time_to_live=None,
+            delete_callback=cleanup_translation_session,
         )
 
         file_input.upload(
@@ -3511,6 +3718,7 @@ with gr.Blocks(
                 output_file_dual,  # visibility
                 output_file_glossary,  # visibility
             ],
+            queue=False,
         )
 
         # Handle file clear/delete event
@@ -3529,6 +3737,7 @@ with gr.Blocks(
                 output_file_dual,  # Hide dual button visibility
                 output_file_glossary,  # Hide glossary button visibility
             ],
+            queue=False,
         )
 
         # Event bindings
@@ -3733,7 +3942,7 @@ with gr.Blocks(
         )
 
         # Translation button click handler
-        translate_btn.click(
+        translation_event = translate_btn.click(
             translate_files,  # MODIFIED function name
             inputs=[
                 file_type,
@@ -3763,6 +3972,8 @@ with gr.Blocks(
                 uploaded_files_view,  # Uploaded files view
             ],
             show_progress_on=[preview],
+            concurrency_id="translation",
+            concurrency_limit=1,
         )
 
         # ADDED: Handle result selector change
@@ -3817,6 +4028,9 @@ with gr.Blocks(
         cancel_btn.click(
             stop_translate_file,
             inputs=[state],
+            outputs=[state],
+            queue=False,
+            cancels=[translation_event],
         )
 
         # Save button click handler
@@ -4321,6 +4535,8 @@ with gr.Blocks(
             })();
             """
         )
+
+        demo.unload(stop_translation_on_unload)
 
 
 def parse_user_passwd(file_path: str, welcome_page: str) -> tuple[list, str]:
