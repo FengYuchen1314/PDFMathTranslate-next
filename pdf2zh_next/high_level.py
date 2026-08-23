@@ -109,6 +109,10 @@ class SubprocessCrashError(TranslationError):
         return super().__str__()
 
 
+class UnrecoverableCleanupError(TranslationError):
+    """The worker process tree could not be proven dead after cleanup."""
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,7 +131,9 @@ def _translate_wrapper(
             os.setsid()
             process_group_id.value = os.getpgrp()
         except OSError:
-            pass
+            # The parent must never mistake an unavailable isolation boundary
+            # for successful descendant cleanup.
+            process_group_id.value = -1
     logger = logging.getLogger(__name__)
     cancel_event = threading.Event()
     queue_handler = None
@@ -150,9 +156,11 @@ def _translate_wrapper(
         # (cache race), producing many popups. Pre-filling the cache
         # prevents the subprocess call entirely.
         import sys
+
         if sys.platform == "win32":
             try:
                 import joblib.externals.loky.backend.context as _loky_ctx
+
                 if _loky_ctx.physical_cores_cache is None:
                     _loky_ctx.physical_cores_cache = os.cpu_count()
                     logger.info(
@@ -362,7 +370,11 @@ def _signal_process_tree(
         return
     if os.name == "posix":
         try:
-            process_group = process_group_id or os.getpgid(translate_process.pid)
+            process_group = (
+                process_group_id
+                if process_group_id is not None and process_group_id > 0
+                else os.getpgid(translate_process.pid)
+            )
             # Never signal a group unless the worker is its leader.  This guard
             # prevents an early-cancel race from touching the server's group.
             if process_group == translate_process.pid:
@@ -380,7 +392,7 @@ def _signal_process_tree(
 
 
 def _process_group_is_alive(process_group_id: int | None) -> bool:
-    if os.name != "posix" or not process_group_id:
+    if os.name != "posix" or process_group_id is None or process_group_id <= 0:
         return False
     try:
         os.killpg(process_group_id, 0)
@@ -391,9 +403,7 @@ def _process_group_is_alive(process_group_id: int | None) -> bool:
         return True
 
 
-def _wait_for_process_group_exit(
-    process_group_id: int | None, timeout: float
-) -> bool:
+def _wait_for_process_group_exit(process_group_id: int | None, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while _process_group_is_alive(process_group_id):
         if time.monotonic() >= deadline:
@@ -616,7 +626,10 @@ async def _translate_in_subprocess(
                 worker_group = (
                     int(process_group_id.value) if process_group_id is not None else 0
                 )
-                if translate_process.is_alive() or _process_group_is_alive(worker_group):
+                isolation_failed = os.name == "posix" and worker_group < 0
+                if translate_process.is_alive() or _process_group_is_alive(
+                    worker_group
+                ):
                     logger.warning(
                         "Translation worker tree did not stop; terminating its group"
                     )
@@ -629,7 +642,9 @@ async def _translate_in_subprocess(
                     _wait_for_process_group_exit(worker_group, timeout=2)
                 # The leader often exits before a TERM-resistant descendant.
                 # Check the cached process group independently of leader state.
-                if translate_process.is_alive() or _process_group_is_alive(worker_group):
+                if translate_process.is_alive() or _process_group_is_alive(
+                    worker_group
+                ):
                     logger.warning("Translation worker group still alive; killing it")
                     _signal_process_tree(
                         translate_process,
@@ -638,15 +653,23 @@ async def _translate_in_subprocess(
                     )
                     translate_process.join(timeout=1)
                     _wait_for_process_group_exit(worker_group, timeout=1)
-                if translate_process.is_alive() or _process_group_is_alive(worker_group):
-                    cleanup_error = SubprocessCrashError(
-                        "Could not stop translation subprocess tree", exit_code=None
+                if translate_process.is_alive() or _process_group_is_alive(
+                    worker_group
+                ):
+                    cleanup_error = UnrecoverableCleanupError(
+                        "Could not stop translation subprocess tree"
+                    )
+                elif isolation_failed:
+                    cleanup_error = UnrecoverableCleanupError(
+                        "Translation subprocess could not establish an isolated "
+                        "process group"
                     )
                 exit_code = translate_process.exitcode
             except Exception:
                 logger.exception("Failed while stopping translation subprocess")
-                if not active_exception:
-                    cleanup_error = IPCError("Failed to stop translation subprocess")
+                cleanup_error = UnrecoverableCleanupError(
+                    "Failed to verify translation subprocess cleanup"
+                )
 
         # A dead worker closes its writer and wakes the receiver.  Only after a
         # bounded join do we close the reader from this thread.
@@ -662,7 +685,12 @@ async def _translate_in_subprocess(
         if recv_t is not None and recv_t.is_alive():
             recv_t.join(timeout=0.2)
             if recv_t.is_alive():
-                logger.warning("Progress listener did not stop within the cleanup bound")
+                logger.warning(
+                    "Progress listener did not stop within the cleanup bound"
+                )
+                cleanup_error = UnrecoverableCleanupError(
+                    "Progress listener did not stop during subprocess cleanup"
+                )
 
         # The child normally sends the log sentinel.  If it was killed, the
         # stop event releases get(timeout=...) without the parent ever writing
@@ -672,6 +700,9 @@ async def _translate_in_subprocess(
             log_t.join(timeout=1)
             if log_t.is_alive():
                 logger.warning("Log listener did not stop within the cleanup bound")
+                cleanup_error = UnrecoverableCleanupError(
+                    "Log listener did not stop during subprocess cleanup"
+                )
         if logger_queue is not None:
             try:
                 logger_queue.cancel_join_thread()
@@ -695,13 +726,17 @@ async def _translate_in_subprocess(
                 translate_process.close()
             except ValueError:
                 logger.warning("Could not close a still-running translation process")
+                cleanup_error = UnrecoverableCleanupError(
+                    "Could not close translation process after cleanup"
+                )
 
         logger.debug("Translation worker exit code: %s", exit_code)
 
-        # Cleanup must never replace cancellation, GeneratorExit, timeout, or
-        # another exception already propagating from the consumer.
-        if active_exception or expected_stop:
-            cleanup_error = None
+        # A routine cleanup error must not replace cancellation. An
+        # UnrecoverableCleanupError is different: publishing `cancelled` would
+        # let the Rust queue advance while an unproven process tree may remain.
+        if cleanup_error is not None and (active_exception or expected_stop):
+            raise cleanup_error
 
     if cleanup_error is not None:
         raise cleanup_error
@@ -872,6 +907,10 @@ async def do_translate_async_stream(
     except TranslationError as e:
         # Log and re-raise structured errors
         logger.error(f"Translation error: {e}")
+        if isinstance(e, UnrecoverableCleanupError):
+            # Never suspend at an error event: a consumer could close the
+            # generator there and accidentally swallow this fail-stop signal.
+            raise
         if isinstance(e, BabeldocError) and e.original_error:
             logger.error(f"Original babeldoc error: {e.original_error}")
         elif isinstance(e, SubprocessError) and e.traceback_str:

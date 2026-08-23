@@ -36,6 +36,12 @@
 
 PDF scientific paper translation and bilingual comparison. Based on [BabelDOC](https://github.com/funstory-ai/BabelDOC). Additionally, this project is also the official reference implementation for calling BabelDOC to perform PDF translation.
 
+> **This deployment branch uses a new web architecture.** The public service is a
+> Rust API and React single-page application; FastAPI is an internal BabelDOC
+> bridge, and the web translation provider is locked to Google. See
+> [docs/architecture-rust-fastapi.md](./docs/architecture-rust-fastapi.md) for the
+> lifecycle, cancellation guarantees, deployment, and verification commands.
+
 - 📊 Preserve formulas, charts, table of contents, and annotations _([preview](#preview))_.
 - 🌐 Support [multiple languages](https://pdf2zh-next.com/supported_languages.html), and diverse [translation services](https://pdf2zh-next.com/advanced/Documentation-of-Translation-Services.html).
 - 🤖 Provides [commandline tool](https://pdf2zh-next.com/getting-started/USAGE_commandline.html), [interactive user interface](https://pdf2zh-next.com/getting-started/USAGE_webui.html), and [Docker](https://pdf2zh-next.com/getting-started/INSTALLATION_docker.html)

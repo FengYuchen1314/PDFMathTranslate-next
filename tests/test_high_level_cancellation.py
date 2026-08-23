@@ -91,13 +91,14 @@ class FakeValue:
 
 
 class FakeContext:
-    def __init__(self, progress_messages, *, start_error=None):
+    def __init__(self, progress_messages, *, start_error=None, group_value=0):
         self.progress_recv = FakeConnection(progress_messages)
         self.progress_send = FakeConnection()
         self.cancel_recv = FakeConnection()
         self.cancel_send = FakeConnection()
         self.log_queue = FakeLogQueue()
         self.process = FakeProcess(start_error=start_error)
+        self.group_value = group_value
         self.pipe_count = 0
 
     def Pipe(self, duplex=False):  # noqa: N802 - mirrors multiprocessing context
@@ -112,7 +113,8 @@ class FakeContext:
 
     def Value(self, typecode, value):  # noqa: N802 - mirrors multiprocessing context
         assert typecode == "q"
-        return FakeValue(value)
+        assert value == 0
+        return FakeValue(self.group_value)
 
     def Process(self, target, args):  # noqa: N802 - mirrors multiprocessing context
         assert target is high_level._translate_wrapper
@@ -166,6 +168,25 @@ def test_clean_exit_without_finish_is_an_ipc_error(monkeypatch):
             pass
 
     with pytest.raises(high_level.IPCError, match="without a finish event"):
+        asyncio.run(consume())
+    assert context.process.closed is True
+
+
+def test_failed_process_group_isolation_is_unrecoverable(monkeypatch):
+    finish = {"type": "finish", "translate_result": object()}
+    context = FakeContext([finish, None], group_value=-1)
+    monkeypatch.setattr(high_level.multiprocessing, "get_context", lambda _: context)
+
+    async def consume():
+        async for _event in high_level._translate_in_subprocess(
+            None, Path("input.pdf")
+        ):
+            pass
+
+    with pytest.raises(
+        high_level.UnrecoverableCleanupError,
+        match="isolated process group",
+    ):
         asyncio.run(consume())
     assert context.process.closed is True
 

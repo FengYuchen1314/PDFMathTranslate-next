@@ -1,15 +1,127 @@
+name: pdf2zh-next
+
 services:
-  pdf2zh:
-    build: ./app
-    image: pdf2zh-next-fixed:latest
-    container_name: pdf2zh-next
+  storage-init:
+    image: busybox:1.37.0
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - chown -R 10001:10001 /data/jobs /data/state
+    restart: "no"
+    volumes:
+      - jobs:/data/jobs
+      - web-state:/data/state
+
+  translator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+    image: pdf2zh-next-translator:latest
+    container_name: pdf2zh-next-translator
     init: true
     restart: unless-stopped
-    ports:
-      - "7860:7860"
-    volumes:
-      - ./config:/root/.config/pdf2zh
+    stop_grace_period: 60s
+    mem_limit: 8g
+    pids_limit: 512
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    expose:
+      - "8000"
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
     environment:
       TZ: Asia/Shanghai
-      PDF2ZH_LANG_IN: en
-      PDF2ZH_LANG_OUT: zh-CN
+      PDF2ZH_DATA_ROOT: /data/jobs
+      PDF2ZH_WORKER_TOKEN: ${PDF2ZH_WORKER_TOKEN:?set PDF2ZH_WORKER_TOKEN}
+      PDF2ZH_WORKER_JOB_RETENTION_SECONDS: "${PDF2ZH_WORKER_JOB_RETENTION_SECONDS:-21600}"
+      PDF2ZH_WORKER_MAX_JOURNAL_EVENTS: "10000"
+      PDF2ZH_CANCEL_HARD_TIMEOUT_SECONDS: "${PDF2ZH_CANCEL_HARD_TIMEOUT_SECONDS:-75}"
+      PDF2ZH_SUPERVISOR_FAILURE_LIMIT: "${PDF2ZH_SUPERVISOR_FAILURE_LIMIT:-18}"
+      PDF2ZH_SUPERVISOR_CHILD_STOP_SECONDS: "${PDF2ZH_SUPERVISOR_CHILD_STOP_SECONDS:-45}"
+    volumes:
+      - jobs:/data/jobs
+      - translator-cache:/home/app/.cache
+      - translator-config:/home/app/.config/pdf2zh
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import os,urllib.request;
+          r=urllib.request.Request('http://127.0.0.1:8000/internal/health',headers={'x-worker-token':os.environ['PDF2ZH_WORKER_TOKEN']});
+          urllib.request.urlopen(r,timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  web:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: pdf2zh-next-web:latest
+    container_name: pdf2zh-next-web
+    init: true
+    restart: unless-stopped
+    # A shutdown can spend one reconciliation window plus one worker recycle
+    # window proving that the old translation cgroup is gone.
+    stop_grace_period: 360s
+    mem_limit: 1g
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      translator:
+        condition: service_healthy
+    ports:
+      - "${PDF2ZH_BIND_ADDRESS:-0.0.0.0}:${PDF2ZH_PORT:-7860}:7860"
+    environment:
+      TZ: Asia/Shanghai
+      PORT: "7860"
+      PDF2ZH_DATA_ROOT: /data/jobs
+      PDF2ZH_STATE_ROOT: /data/state
+      PDF2ZH_FRONTEND_DIR: /app/frontend
+      PDF2ZH_WORKER_URL: http://translator:8000
+      PDF2ZH_WORKER_TOKEN: ${PDF2ZH_WORKER_TOKEN:?set PDF2ZH_WORKER_TOKEN}
+      PDF2ZH_CONCURRENCY: "1"
+      PDF2ZH_MAX_ACTIVE_JOBS: "${PDF2ZH_MAX_ACTIVE_JOBS:-4}"
+      PDF2ZH_MAX_UPLOAD_BYTES: "104857600"
+      PDF2ZH_UPLOAD_TIMEOUT_SECONDS: "${PDF2ZH_UPLOAD_TIMEOUT_SECONDS:-300}"
+      PDF2ZH_LEASE_SECONDS: "${PDF2ZH_LEASE_SECONDS:-180}"
+      PDF2ZH_RELEASE_GRACE_SECONDS: "${PDF2ZH_RELEASE_GRACE_SECONDS:-15}"
+      PDF2ZH_CANCEL_RECONCILE_SECONDS: "${PDF2ZH_CANCEL_RECONCILE_SECONDS:-120}"
+      PDF2ZH_WORKER_RECYCLE_SECONDS: "${PDF2ZH_WORKER_RECYCLE_SECONDS:-180}"
+      PDF2ZH_TERMINAL_RETENTION_SECONDS: "21600"
+      PDF2ZH_ID_TOMBSTONE_SECONDS: "${PDF2ZH_ID_TOMBSTONE_SECONDS:-21600}"
+    volumes:
+      - jobs:/data/jobs
+      - web-state:/data/state
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:7860/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+
+volumes:
+  jobs:
+  translator-cache:
+  translator-config:
+  web-state:

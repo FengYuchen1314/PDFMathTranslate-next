@@ -1,0 +1,10 @@
+babeldoc>=0.6.2,<0.7.0
+pymupdf<1.25.3
+fastapi>=0.115.12
+uvicorn>=0.34.2
+pydantic>=2.10.6
+requests
+tenacity
+rich
+peewee>=3.17.8
+tomlkit

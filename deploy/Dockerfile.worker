@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.7
+
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        build-essential \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md ./
+COPY deploy/requirements.worker.txt deploy/requirements.worker.lock.txt ./deploy/
+RUN uv pip install --system --no-cache --compile-bytecode \
+        -r deploy/requirements.worker.lock.txt
+
+COPY pdf2zh_next ./pdf2zh_next
+RUN uv pip install --system --no-cache --no-deps . \
+    && groupadd --gid 10001 app \
+    && useradd --create-home --uid 10001 --gid 10001 app \
+    && mkdir -p /data/jobs /home/app/.cache /home/app/.config/pdf2zh \
+    && chown -R app:app /data /home/app
+
+ENV HOME=/home/app \
+    PYTHONUNBUFFERED=1 \
+    PDF2ZH_DATA_ROOT=/data/jobs
+
+USER app
+RUN babeldoc --version && babeldoc --warmup
+
+EXPOSE 8000
+CMD ["python", "-m", "pdf2zh_next.worker_supervisor"]

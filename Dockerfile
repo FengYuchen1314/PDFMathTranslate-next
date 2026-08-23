@@ -1,32 +1,35 @@
-FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+# syntax=docker/dockerfile:1.7
 
-WORKDIR /app
+FROM node:24-bookworm-slim AS frontend-build
+WORKDIR /src/frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
 
+FROM rust:1.96-slim-bookworm AS rust-build
+WORKDIR /src/backend-rs
+COPY backend-rs/Cargo.toml backend-rs/Cargo.lock ./
+COPY backend-rs/src ./src
+RUN cargo build --locked --release
 
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 app \
+    && mkdir -p /app/frontend /data/jobs /data/state \
+    && chown -R app:app /app /data
+
+COPY --from=rust-build /src/backend-rs/target/release/pdf2zh-web /usr/local/bin/pdf2zh-web
+COPY --from=frontend-build /src/frontend/dist/ /app/frontend/
+
+ENV PORT=7860 \
+    PDF2ZH_DATA_ROOT=/data/jobs \
+    PDF2ZH_STATE_ROOT=/data/state \
+    PDF2ZH_FRONTEND_DIR=/app/frontend \
+    RUST_LOG=pdf2zh_web=info,tower_http=info
+
+USER app
 EXPOSE 7860
-
-ENV PYTHONUNBUFFERED=1
-
-# # Download all required fonts
-# ADD "https://github.com/satbyy/go-noto-universal/releases/download/v7.0/GoNotoKurrent-Regular.ttf" /app/
-# ADD "https://github.com/timelic/source-han-serif/releases/download/main/SourceHanSerifCN-Regular.ttf" /app/
-# ADD "https://github.com/timelic/source-han-serif/releases/download/main/SourceHanSerifTW-Regular.ttf" /app/
-# ADD "https://github.com/timelic/source-han-serif/releases/download/main/SourceHanSerifJP-Regular.ttf" /app/
-# ADD "https://github.com/timelic/source-han-serif/releases/download/main/SourceHanSerifKR-Regular.ttf" /app/
-
-RUN apt-get update && \
-     apt-get install --no-install-recommends -y libgl1 libglib2.0-0 libxext6 libsm6 libxrender1 build-essential && \
-     rm -rf /var/lib/apt/lists/*
-
-COPY pyproject.toml .
-RUN uv pip install --system --no-cache -r pyproject.toml && babeldoc --version && babeldoc --warmup
-
-COPY . .
-
-# Calls for a random number to break the cahing of babeldoc upgrade
-# (https://stackoverflow.com/questions/35134713/disable-cache-for-specific-run-commands/58801213#58801213)
-ADD "https://www.random.org/cgi-bin/randbyte?nbytes=10&format=h" skipcache
-
-RUN uv pip install --system --no-cache . && uv pip install --system --no-cache --compile-bytecode -U babeldoc "pymupdf<1.25.3" && babeldoc --version && babeldoc --warmup
-RUN pdf2zh --version
-CMD ["pdf2zh", "--gui"]
+CMD ["pdf2zh-web"]
