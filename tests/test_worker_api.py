@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from pdf2zh_next import worker_api
 from pdf2zh_next.config.translate_engine_model import GoogleSettings
+from pdf2zh_next.config.translate_engine_model import OpenAISettings
 from pdf2zh_next.high_level import UnrecoverableCleanupError
 
 
@@ -22,14 +23,182 @@ def make_request(input_path: Path, output_dir: Path, **overrides):
     return worker_api.TranslationRequest(**values)
 
 
-def test_worker_settings_are_google_only(tmp_path):
+def test_worker_defaults_to_google_settings(tmp_path):
     request = make_request(tmp_path / "input.pdf", tmp_path / "output")
     settings = worker_api._build_settings(request, tmp_path / "output")
 
+    assert request.provider == "google"
     assert isinstance(settings.translate_engine_settings, GoogleSettings)
     assert settings.term_extraction_engine_settings is None
     assert settings.translation.no_auto_extract_glossary is True
     assert settings.pdf.watermark_output_mode == "no_watermark"
+
+
+@pytest.mark.parametrize(
+    ("model", "thinking_mode", "reasoning_effort"),
+    [
+        ("deepseek-v4-flash", None, None),
+        ("deepseek-v4-pro", None, None),
+        ("deepseek-v4-flash", "disabled", None),
+        ("deepseek-v4-pro", "disabled", None),
+        ("deepseek-v4-flash", "enabled", "low"),
+        ("deepseek-v4-flash", "enabled", "high"),
+        ("deepseek-v4-pro", "enabled", "max"),
+    ],
+)
+def test_worker_builds_supported_deepseek_settings(
+    tmp_path,
+    monkeypatch,
+    model,
+    thinking_mode,
+    reasoning_effort,
+):
+    monkeypatch.setenv("PDF2ZH_DEEPSEEK_API_KEY", "  server-secret  ")
+    request = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="deepseek",
+        deepseek_model=model,
+        deepseek_thinking_mode=thinking_mode,
+        deepseek_reasoning_effort=reasoning_effort,
+    )
+
+    settings = worker_api._build_settings(request, tmp_path / "output")
+    engine = settings.translate_engine_settings
+
+    assert isinstance(engine, OpenAISettings)
+    assert engine.openai_model == model
+    assert engine.openai_api_key == "server-secret"
+    assert engine.openai_base_url == "https://api.deepseek.com"
+    if thinking_mode is None:
+        assert engine._openai_extra_body is None
+        assert engine.openai_send_reasoning_effort is None
+    else:
+        assert engine._openai_extra_body == {
+            "thinking": {"type": thinking_mode},
+        }
+        if thinking_mode == "enabled":
+            assert engine.openai_send_reasoning_effort is True
+            assert engine.openai_reasoning_effort == reasoning_effort
+        else:
+            assert engine.openai_send_reasoning_effort is None
+            assert engine.openai_reasoning_effort is None
+
+
+@pytest.mark.parametrize("api_key", [None, "", "   "])
+def test_worker_rejects_deepseek_when_server_key_is_missing(
+    tmp_path, monkeypatch, api_key
+):
+    if api_key is None:
+        monkeypatch.delenv("PDF2ZH_DEEPSEEK_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("PDF2ZH_DEEPSEEK_API_KEY", api_key)
+    request = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="deepseek",
+        deepseek_model="deepseek-v4-flash",
+    )
+
+    with pytest.raises(ValueError, match="not configured"):
+        worker_api._build_settings(request, tmp_path / "output")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"provider": "deepseek"},
+        {"deepseek_model": "deepseek-v4-flash"},
+        {
+            "provider": "deepseek",
+            "deepseek_model": "deepseek-chat",
+        },
+        {
+            "provider": "deepseek",
+            "deepseek_model": "deepseek-v4-flash",
+            "deepseek_reasoning_effort": "high",
+        },
+        {
+            "provider": "deepseek",
+            "deepseek_model": "deepseek-v4-pro",
+            "deepseek_thinking_mode": "disabled",
+            "deepseek_reasoning_effort": "max",
+        },
+    ],
+)
+def test_worker_rejects_invalid_provider_option_combinations(tmp_path, overrides):
+    with pytest.raises(ValueError):
+        make_request(tmp_path / "input.pdf", tmp_path / "output", **overrides)
+
+
+def test_worker_request_schema_cannot_accept_deepseek_secrets(tmp_path):
+    schema = worker_api.TranslationRequest.model_json_schema()
+    properties = schema["properties"]
+
+    assert "api_key" not in properties
+    assert "deepseek_api_key" not in properties
+    assert "base_url" not in properties
+    assert "deepseek_base_url" not in properties
+    request = make_request(tmp_path / "input.pdf", tmp_path / "output")
+    assert all("key" not in name and "url" not in name for name in request.model_dump())
+    injected = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="deepseek",
+        deepseek_model="deepseek-v4-flash",
+        deepseek_api_key="client-secret",
+        deepseek_base_url="https://attacker.invalid",
+    )
+    assert "client-secret" not in repr(injected)
+    assert "attacker.invalid" not in repr(injected)
+    assert "deepseek_api_key" not in injected.model_dump()
+    assert "deepseek_base_url" not in injected.model_dump()
+
+    with pytest.raises(ValueError) as exc_info:
+        make_request(
+            tmp_path / "input.pdf",
+            tmp_path / "output",
+            provider="deepseek",
+            deepseek_api_key="client-secret",
+        )
+    assert "client-secret" not in str(exc_info.value)
+    request_error = worker_api.RequestValidationError(exc_info.value.errors())
+    response = asyncio.run(
+        worker_api.sanitized_request_validation_error(None, request_error)
+    )
+    assert b"client-secret" not in response.body
+    assert b'"input"' not in response.body
+
+
+def test_worker_health_reports_deepseek_only_when_server_key_exists(monkeypatch):
+    monkeypatch.delenv("PDF2ZH_DEEPSEEK_API_KEY", raising=False)
+    without_key = asyncio.run(worker_api.health(None))
+
+    monkeypatch.setenv("PDF2ZH_DEEPSEEK_API_KEY", "  server-secret  ")
+    with_key = asyncio.run(worker_api.health(None))
+
+    assert without_key["provider"] == "google"
+    assert without_key["providers"] == ["google"]
+    assert with_key["provider"] == "google"
+    assert with_key["providers"] == ["google", "deepseek"]
+    assert "server-secret" not in repr(with_key)
+
+
+def test_public_error_redacts_deepseek_credentials(monkeypatch):
+    configured_key = "sk-configured-secret-12345678"
+    monkeypatch.setenv("PDF2ZH_DEEPSEEK_API_KEY", configured_key)
+
+    message = worker_api._public_error(
+        "request failed "
+        f"api_key={configured_key} "
+        "Authorization: Bearer sk-header-secret-87654321 "
+        "access_token=another-sensitive-token"
+    )
+
+    assert configured_key not in message
+    assert "sk-header-secret-87654321" not in message
+    assert "another-sensitive-token" not in message
+    assert message.count("<redacted>") >= 3
 
 
 def test_worker_rejects_auto_target_language(tmp_path):

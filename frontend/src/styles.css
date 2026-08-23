@@ -429,6 +429,22 @@ fieldset:disabled {
   width: 16px;
 }
 
+.provider-settings {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.deepseek-settings {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(120, 226, 207, 0.14);
+  border-radius: 13px;
+  background: rgba(120, 226, 207, 0.035);
+}
+
 .language-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 38px minmax(0, 1fr);

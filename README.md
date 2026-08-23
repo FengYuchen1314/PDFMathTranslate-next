@@ -38,7 +38,8 @@ PDF scientific paper translation and bilingual comparison. Based on [BabelDOC](h
 
 > **This deployment branch uses a new web architecture.** The public service is a
 > Rust API and React single-page application; FastAPI is an internal BabelDOC
-> bridge, and the web translation provider is locked to Google. See
+> bridge. Google is always available, while server-configured DeepSeek uses the
+> current V4 Flash/Pro API without sending credentials through the browser. See
 > [docs/architecture-rust-fastapi.md](./docs/architecture-rust-fastapi.md) for the
 > lifecycle, cancellation guarantees, deployment, and verification commands.
 

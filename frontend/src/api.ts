@@ -112,6 +112,19 @@ export async function createJob(
   form.append("pages", draft.pages.trim());
   form.append("output_mono", String(draft.outputMono));
   form.append("output_dual", String(draft.outputDual));
+  form.append("provider", draft.provider);
+  if (draft.provider === "deepseek") {
+    form.append("deepseek_model", draft.deepseekModel);
+    if (draft.deepseekThinkingMode) {
+      form.append("deepseek_thinking_mode", draft.deepseekThinkingMode);
+    }
+    if (draft.deepseekThinkingMode === "enabled") {
+      form.append(
+        "deepseek_reasoning_effort",
+        draft.deepseekReasoningEffort,
+      );
+    }
+  }
   return requestJson<{ id: string; status: JobStatus }>(
     "/api/jobs",
     {

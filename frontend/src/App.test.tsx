@@ -16,6 +16,23 @@ import { mergeJobUpdate, useTranslationJob } from "./useTranslationJob";
 
 const CONFIG = {
   provider: "google",
+  providers: [
+    { id: "google", name: "Google", available: true },
+    {
+      id: "deepseek",
+      name: "DeepSeek",
+      available: false,
+      unavailableReason: "not_configured",
+      models: [
+        { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+        { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" },
+      ],
+      defaultModel: "deepseek-v4-flash",
+      thinkingModes: ["enabled", "disabled"],
+      reasoningEfforts: ["low", "high", "max"],
+      defaultReasoningEffort: "high",
+    },
+  ],
   maxUploadBytes: 10_000_000,
   languages: [
     { code: "en", name: "英语" },
@@ -23,7 +40,18 @@ const CONFIG = {
   ],
 };
 
+const DEEPSEEK_CONFIG = {
+  ...CONFIG,
+  providers: CONFIG.providers.map((provider) =>
+    provider.id === "deepseek" ? { ...provider, available: true } : provider,
+  ),
+};
+
 const TEST_DRAFT: JobDraft = {
+  provider: "google",
+  deepseekModel: "deepseek-v4-flash",
+  deepseekThinkingMode: "",
+  deepseekReasoningEffort: "high",
   sourceLang: "en",
   targetLang: "zh",
   pages: "",
@@ -254,12 +282,180 @@ describe("PDF translation workbench", () => {
     );
     expect(createCall).toBeDefined();
     expect((createCall?.[1] as RequestInit).body).toBeInstanceOf(FormData);
+    const createForm = (createCall?.[1] as RequestInit).body as FormData;
+    expect(createForm.get("provider")).toBe("google");
+    expect(createForm.has("deepseek_model")).toBe(false);
+    expect(createForm.has("deepseek_thinking_mode")).toBe(false);
+    expect(createForm.has("deepseek_reasoning_effort")).toBe(false);
     expect(
       ((createCall?.[1] as RequestInit).headers as Record<string, string>)[
         "x-job-id"
       ],
     ).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(await screen.findByText("正在处理文档")).toBeInTheDocument();
+  });
+
+  it("submits only the current DeepSeek V4 fields selected in the UI", async () => {
+    const user = userEvent.setup();
+    let submitted: FormData | null = null;
+    let submittedId = "";
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = String(input);
+        if (url === "/api/health") return jsonResponse({ ok: true });
+        if (url === "/api/config") return jsonResponse(DEEPSEEK_CONFIG);
+        if (url === "/api/jobs" && init?.method === "POST") {
+          submitted = init.body as FormData;
+          submittedId = reservedJobId(init);
+          return jsonResponse({ id: submittedId, status: "queued" });
+        }
+        if (submittedId && url === `/api/jobs/${submittedId}/heartbeat`) {
+          return emptyResponse();
+        }
+        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    const providerSelect = await screen.findByLabelText("翻译渠道");
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: "DeepSeek" })).not.toBeDisabled(),
+    );
+    await user.selectOptions(providerSelect, "deepseek");
+    await user.selectOptions(screen.getByLabelText("DeepSeek 模型"), "deepseek-v4-pro");
+    await user.selectOptions(
+      screen.getByLabelText("DeepSeek Thinking 模式"),
+      "enabled",
+    );
+    expect(screen.getByRole("option", { name: "Low" })).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("DeepSeek 推理强度"), "max");
+    await user.upload(screen.getByLabelText("选择 PDF 文件"), testPdf());
+    await user.click(screen.getByRole("button", { name: "开始翻译" }));
+
+    await waitFor(() => expect(submitted).not.toBeNull());
+    const form = submitted as unknown as FormData;
+    expect(Array.from(form.keys())).toEqual([
+      "file",
+      "source_lang",
+      "target_lang",
+      "pages",
+      "output_mono",
+      "output_dual",
+      "provider",
+      "deepseek_model",
+      "deepseek_thinking_mode",
+      "deepseek_reasoning_effort",
+    ]);
+    expect(form.get("provider")).toBe("deepseek");
+    expect(form.get("deepseek_model")).toBe("deepseek-v4-pro");
+    expect(form.get("deepseek_thinking_mode")).toBe("enabled");
+    expect(form.get("deepseek_reasoning_effort")).toBe("max");
+    expect(screen.getAllByText("DeepSeek").length).toBeGreaterThan(0);
+    expect(screen.getByText("翻译渠道：DeepSeek")).toBeInTheDocument();
+  });
+
+  it("omits DeepSeek reasoning effort when thinking is explicitly disabled", async () => {
+    const user = userEvent.setup();
+    let submitted: FormData | null = null;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = String(input);
+        if (url === "/api/health") return jsonResponse({ ok: true });
+        if (url === "/api/config") return jsonResponse(DEEPSEEK_CONFIG);
+        if (url === "/api/jobs" && init?.method === "POST") {
+          submitted = init.body as FormData;
+          return jsonResponse({ id: reservedJobId(init), status: "queued" });
+        }
+        if (url.endsWith("/heartbeat")) return emptyResponse();
+        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: "DeepSeek" })).not.toBeDisabled(),
+    );
+    await user.selectOptions(screen.getByLabelText("翻译渠道"), "deepseek");
+    expect(screen.queryByLabelText("DeepSeek 推理强度")).not.toBeInTheDocument();
+    await user.selectOptions(
+      screen.getByLabelText("DeepSeek Thinking 模式"),
+      "disabled",
+    );
+    expect(screen.queryByLabelText("DeepSeek 推理强度")).not.toBeInTheDocument();
+    await user.upload(screen.getByLabelText("选择 PDF 文件"), testPdf());
+    await user.click(screen.getByRole("button", { name: "开始翻译" }));
+
+    await waitFor(() => expect(submitted).not.toBeNull());
+    const form = submitted as unknown as FormData;
+    expect(form.get("deepseek_thinking_mode")).toBe("disabled");
+    expect(form.has("deepseek_reasoning_effort")).toBe(false);
+  });
+
+  it("shows DeepSeek as disabled when the server has no API key", async () => {
+    installFetch({ id: "unused", status: "queued" });
+    render(<App />);
+
+    const unavailable = await screen.findByRole("option", {
+      name: "DeepSeek（服务器未配置）",
+    });
+    expect(unavailable).toBeDisabled();
+    expect(screen.getByLabelText("翻译渠道")).toHaveValue("google");
+  });
+
+  it("preserves a stored DeepSeek choice while the provider is unavailable", async () => {
+    window.localStorage.setItem(
+      "pdf2zh.translation-draft",
+      JSON.stringify({
+        ...TEST_DRAFT,
+        provider: "deepseek",
+      }),
+    );
+    installFetch({ id: "unused", status: "queued" });
+    render(<App />);
+
+    expect(
+      await screen.findByRole("option", { name: "DeepSeek（服务器未配置）" }),
+    ).toBeDisabled();
+    expect(screen.getByLabelText("翻译渠道")).toHaveValue("deepseek");
+    await waitFor(() => {
+      const stored = JSON.parse(
+        window.localStorage.getItem("pdf2zh.translation-draft") ?? "{}",
+      ) as Record<string, unknown>;
+      expect(stored.provider).toBe("deepseek");
+    });
+  });
+
+  it("loads an old Google-only draft with the new provider defaults", async () => {
+    window.localStorage.setItem(
+      "pdf2zh.translation-draft",
+      JSON.stringify({
+        sourceLang: "en",
+        targetLang: "zh",
+        pages: "1-2",
+        outputMono: true,
+        outputDual: false,
+      }),
+    );
+    installFetch({ id: "unused", status: "queued" });
+    render(<App />);
+
+    expect(await screen.findByLabelText("翻译渠道")).toHaveValue("google");
+    expect(
+      screen.getByPlaceholderText("留空翻译全部，如 1-3, 5, 8-10"),
+    ).toHaveValue("1-2");
+    await waitFor(() => {
+      const stored = JSON.parse(
+        window.localStorage.getItem("pdf2zh.translation-draft") ?? "{}",
+      ) as Record<string, unknown>;
+      expect(stored).toMatchObject({
+        provider: "google",
+        deepseekModel: "deepseek-v4-flash",
+        deepseekThinkingMode: "",
+        deepseekReasoningEffort: "high",
+      });
+    });
   });
 
   it("releases an active job with a beacon on pagehide", async () => {

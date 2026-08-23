@@ -187,7 +187,7 @@ class DeepSeekSettings(BaseModel):
         default="yes", description="Whether the translator supports LLM"
     )
     deepseek_model: str = Field(
-        default="deepseek-chat", description="DeepSeek model to use"
+        default="deepseek-v4-flash", description="DeepSeek model to use"
     )
     deepseek_api_key: str | None = Field(
         default=None, description="API key for DeepSeek service"
@@ -212,11 +212,11 @@ class DeepSeekSettings(BaseModel):
     )
     deepseek_reasoning_effort: str | None = Field(
         default=None,
-        description="Reasoning effort for DeepSeek thinking mode (high/max)",
+        description="Reasoning effort for DeepSeek thinking mode (low/high/max)",
         json_schema_extra={
             "gui": {
                 "widget": "dropdown",
-                "choices": ["high", "max"],
+                "choices": ["low", "high", "max"],
                 "default_on_show": "high",
                 "visible_when": {
                     "field": "deepseek_thinking_mode",
@@ -234,29 +234,33 @@ class DeepSeekSettings(BaseModel):
         self.deepseek_model = _clean_string(self.deepseek_model)
         self.deepseek_thinking_mode = _clean_string(self.deepseek_thinking_mode)
         self.deepseek_reasoning_effort = _clean_string(self.deepseek_reasoning_effort)
+        if self.deepseek_model not in ("deepseek-v4-flash", "deepseek-v4-pro"):
+            raise ValueError(
+                "DeepSeek model must be deepseek-v4-flash or deepseek-v4-pro"
+            )
         if self.deepseek_thinking_mode not in (None, "enabled", "disabled"):
             raise ValueError("DeepSeek thinking mode must be enabled or disabled")
         if self.deepseek_reasoning_effort and self.deepseek_reasoning_effort not in (
+            "low",
             "high",
             "max",
         ):
-            raise ValueError("DeepSeek reasoning effort must be high or max")
+            raise ValueError("DeepSeek reasoning effort must be low, high, or max")
 
     def transform(self) -> OpenAISettings:
         settings = OpenAISettings(
             openai_model=self.deepseek_model,
             openai_api_key=self.deepseek_api_key,
-            openai_base_url="https://api.deepseek.com/v1",
+            openai_base_url="https://api.deepseek.com",
             openai_enable_json_mode=self.deepseek_enable_json_mode,
         )
-        if self.deepseek_model and self.deepseek_model.startswith("deepseek-v4-"):
-            if self.deepseek_thinking_mode == "enabled":
-                settings._openai_extra_body = {"thinking": {"type": "enabled"}}
-                if self.deepseek_reasoning_effort:
-                    settings.openai_reasoning_effort = self.deepseek_reasoning_effort
-                    settings.openai_send_reasoning_effort = True
-            elif self.deepseek_thinking_mode == "disabled":
-                settings._openai_extra_body = {"thinking": {"type": "disabled"}}
+        if self.deepseek_thinking_mode == "enabled":
+            settings._openai_extra_body = {"thinking": {"type": "enabled"}}
+            if self.deepseek_reasoning_effort:
+                settings.openai_reasoning_effort = self.deepseek_reasoning_effort
+                settings.openai_send_reasoning_effort = True
+        elif self.deepseek_thinking_mode == "disabled":
+            settings._openai_extra_body = {"thinking": {"type": "disabled"}}
         return settings
 
 

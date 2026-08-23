@@ -48,7 +48,9 @@ def build_deepseek_settings(
     return settings
 
 
-def build_translator(settings: SettingsModel) -> tuple[OpenAITranslator, FakeOpenAIClient]:
+def build_translator(
+    settings: SettingsModel,
+) -> tuple[OpenAITranslator, FakeOpenAIClient]:
     fake_client = FakeOpenAIClient()
     with patch(
         "pdf2zh_next.translator.translator_impl.openai.openai.OpenAI",
@@ -58,10 +60,24 @@ def build_translator(settings: SettingsModel) -> tuple[OpenAITranslator, FakeOpe
     return translator, fake_client
 
 
+def test_deepseek_defaults_match_current_official_v4_api():
+    settings = DeepSeekSettings(deepseek_api_key="dummy-key")
+    settings.validate_settings()
+
+    transformed = settings.transform()
+
+    assert settings.deepseek_model == "deepseek-v4-flash"
+    assert transformed.openai_model == "deepseek-v4-flash"
+    assert transformed.openai_base_url == "https://api.deepseek.com"
+
+
 def test_deepseek_v4_unforced_omits_extra_body_and_reasoning_effort():
     settings = build_deepseek_settings("deepseek-v4-flash")
     translator, fake_client = build_translator(settings)
 
+    assert settings.translate_engine_settings.openai_base_url == (
+        "https://api.deepseek.com"
+    )
     translator.do_translate("hello")
 
     request_kwargs = fake_client.completions.calls[0]
@@ -99,6 +115,21 @@ def test_deepseek_v4_enabled_sends_extra_body_and_configured_effort():
     assert request_kwargs["reasoning_effort"] == "high"
 
 
+def test_deepseek_v4_pro_enabled_forwards_low_reasoning_effort():
+    settings = build_deepseek_settings(
+        "deepseek-v4-pro",
+        thinking_mode="enabled",
+        reasoning_effort="low",
+    )
+    translator, fake_client = build_translator(settings)
+
+    translator.do_translate("hello")
+
+    request_kwargs = fake_client.completions.calls[0]
+    assert request_kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert request_kwargs["reasoning_effort"] == "low"
+
+
 def test_deepseek_v4_enabled_without_effort_omits_reasoning_effort():
     settings = build_deepseek_settings("deepseek-v4-flash", thinking_mode="enabled")
     translator, fake_client = build_translator(settings)
@@ -133,25 +164,25 @@ def test_deepseek_rejects_unknown_reasoning_effort():
     try:
         settings.validate_settings()
     except ValueError as exc:
-        assert str(exc) == "DeepSeek reasoning effort must be high or max"
+        assert str(exc) == "DeepSeek reasoning effort must be low, high, or max"
     else:
         raise AssertionError("Expected unknown DeepSeek reasoning effort to fail")
 
 
-def test_deepseek_alias_models_do_not_send_extra_body_thinking():
+def test_deepseek_rejects_retired_alias_models():
     for model in ("deepseek-chat", "deepseek-reasoner"):
-        settings = build_deepseek_settings(
-            model,
-            thinking_mode="enabled",
-            reasoning_effort="high",
+        settings = DeepSeekSettings(
+            deepseek_model=model,
+            deepseek_api_key="dummy-key",
         )
-        translator, fake_client = build_translator(settings)
-
-        translator.do_translate("hello")
-
-        request_kwargs = fake_client.completions.calls[0]
-        assert "extra_body" not in request_kwargs
-        assert "reasoning_effort" not in request_kwargs
+        try:
+            settings.validate_settings()
+        except ValueError as exc:
+            assert str(exc) == (
+                "DeepSeek model must be deepseek-v4-flash or deepseek-v4-pro"
+            )
+        else:
+            raise AssertionError("Expected retired DeepSeek model to fail")
 
 
 def test_deepseek_v4_cache_impact_distinguishes_thinking_modes():
@@ -183,5 +214,8 @@ def test_deepseek_v4_cache_impact_distinguishes_thinking_modes():
 
 
 def test_deepseek_settings_excludes_old_paired_thinking_bools():
+    assert DeepSeekSettings.model_fields["deepseek_model"].default == (
+        "deepseek-v4-flash"
+    )
     assert "deepseek_thinking_enabled" not in DeepSeekSettings.model_fields
     assert "deepseek_thinking_disabled" not in DeepSeekSettings.model_fields

@@ -104,11 +104,16 @@ Run all validation and builds on the target Linux host:
 
 ```bash
 python -m pytest -q tests/test_worker_api.py \
-  tests/test_worker_supervisor.py tests/test_high_level_cancellation.py
+  tests/test_worker_supervisor.py tests/test_high_level_cancellation.py \
+  tests/test_deepseek_thinking_mode.py tests/test_gui_deepseek_thinking_mode.py
 python -m ruff format --check pdf2zh_next/worker_api.py \
-  pdf2zh_next/worker_supervisor.py tests/test_worker_api.py
+  pdf2zh_next/worker_supervisor.py pdf2zh_next/config/translate_engine_model.py \
+  tests/test_worker_api.py tests/test_deepseek_thinking_mode.py \
+  tests/test_gui_deepseek_thinking_mode.py
 python -m ruff check pdf2zh_next/worker_api.py \
-  pdf2zh_next/worker_supervisor.py tests/test_worker_api.py
+  pdf2zh_next/worker_supervisor.py pdf2zh_next/config/translate_engine_model.py \
+  tests/test_worker_api.py tests/test_deepseek_thinking_mode.py \
+  tests/test_gui_deepseek_thinking_mode.py
 
 cd backend-rs
 cargo fmt --all -- --check
@@ -124,6 +129,8 @@ cd ..
 
 umask 077
 printf 'PDF2ZH_WORKER_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
+# Optional, and only with a real key: append PDF2ZH_DEEPSEEK_API_KEY to .env.
+# Never deploy a placeholder because any nonblank value advertises the provider.
 docker compose --env-file .env -f deploy/compose.vps.yml config --quiet
 docker compose --env-file .env -f deploy/compose.vps.yml build
 docker compose --env-file .env -f deploy/compose.vps.yml up -d
@@ -133,6 +140,11 @@ python script/vps_rust_api_regression.py \
 python script/vps_worker_failstop_regression.py \
   http://127.0.0.1:7860 long.pdf
 ```
+
+When a real server-side DeepSeek key is configured, append
+`--expect-deepseek` to `vps_rust_api_regression.py`. That flag performs a paid
+one-page live translation with `deepseek-v4-flash` (or the model selected by
+`--deepseek-model`) instead of checking capability metadata alone.
 
 `PDF2ZH_PORT` can publish a staging port during acceptance testing; set
 `PDF2ZH_BIND_ADDRESS=127.0.0.1` so that staging is reachable only through the
@@ -147,3 +159,12 @@ log rotation bound resource growth. A one-shot storage initializer repairs UID 1
 ownership on the shared job and web state volumes before either service starts.
 The translator mounts its cache first so Docker can copy the image's warmed
 BabelDOC assets into a fresh cache volume.
+
+`PDF2ZH_DEEPSEEK_API_KEY` is optional and server-side only. When it is absent,
+the public configuration marks DeepSeek unavailable; when present, users can
+choose the current `deepseek-v4-flash` or `deepseek-v4-pro` models. The key is
+never accepted in a job request or persisted with a job snapshot.
+Because DeepSeek usage is billed to this server key, do not enable it on an
+unauthenticated public endpoint unless the operator accepts public usage or has
+placed an access-control/quota layer in front of the service. The built-in
+single-worker queue limits concurrency, not cumulative spend.

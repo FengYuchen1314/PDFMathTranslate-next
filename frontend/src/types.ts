@@ -11,8 +11,35 @@ export interface LanguageOption {
   name: string;
 }
 
+export type ProviderId = "google" | "deepseek";
+
+export type DeepSeekModel = "deepseek-v4-flash" | "deepseek-v4-pro";
+
+export type DeepSeekThinkingMode = "" | "enabled" | "disabled";
+
+export type DeepSeekReasoningEffort = "low" | "high" | "max";
+
+export interface ProviderModelOption {
+  id: string;
+  name: string;
+}
+
+export interface ProviderDescriptor {
+  id: ProviderId;
+  name: string;
+  available: boolean;
+  unavailableReason?: "not_configured" | "worker_unavailable";
+  models?: ProviderModelOption[];
+  defaultModel?: string | null;
+  thinkingModes?: DeepSeekThinkingMode[];
+  reasoningEfforts?: DeepSeekReasoningEffort[];
+  defaultReasoningEffort?: DeepSeekReasoningEffort | null;
+}
+
 export interface AppConfig {
+  /** Kept for compatibility with the original Google-only configuration. */
   provider: "google";
+  providers?: ProviderDescriptor[];
   languages: LanguageOption[];
   maxUploadBytes: number;
 }
@@ -35,6 +62,10 @@ export interface TranslationJob {
 }
 
 export interface JobDraft {
+  provider: ProviderId;
+  deepseekModel: DeepSeekModel;
+  deepseekThinkingMode: DeepSeekThinkingMode;
+  deepseekReasoningEffort: DeepSeekReasoningEffort;
   sourceLang: string;
   targetLang: string;
   pages: string;

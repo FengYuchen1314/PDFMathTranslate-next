@@ -58,7 +58,13 @@ def expect_status(
     return body
 
 
-def multipart_payload(pdf: Path, pages: str) -> tuple[bytes, str]:
+def multipart_payload(
+    pdf: Path,
+    pages: str,
+    provider: str = "google",
+    deepseek_model: str | None = None,
+    deepseek_thinking_mode: str | None = None,
+) -> tuple[bytes, str]:
     boundary = f"----pdf2zh-{uuid.uuid4().hex}"
     chunks: list[bytes] = []
     fields = {
@@ -67,7 +73,12 @@ def multipart_payload(pdf: Path, pages: str) -> tuple[bytes, str]:
         "pages": pages,
         "output_mono": "true",
         "output_dual": "true",
+        "provider": provider,
     }
+    if provider == "deepseek":
+        fields["deepseek_model"] = deepseek_model or "deepseek-v4-flash"
+        if deepseek_thinking_mode:
+            fields["deepseek_thinking_mode"] = deepseek_thinking_mode
     for name, value in fields.items():
         chunks.extend(
             [
@@ -104,8 +115,17 @@ def submit(
     pdf: Path,
     pages: str = "",
     job_id: str | None = None,
+    provider: str = "google",
+    deepseek_model: str | None = None,
+    deepseek_thinking_mode: str | None = None,
 ) -> dict:
-    payload, boundary = multipart_payload(pdf, pages)
+    payload, boundary = multipart_payload(
+        pdf,
+        pages,
+        provider=provider,
+        deepseek_model=deepseek_model,
+        deepseek_thinking_mode=deepseek_thinking_mode,
+    )
     job_id = job_id or str(uuid.uuid4())
     return request_json(
         f"{base_url}/api/jobs",
@@ -194,6 +214,12 @@ def main() -> None:
     parser.add_argument("--cancel-timeout", type=float, default=90)
     parser.add_argument("--finish-timeout", type=float, default=600)
     parser.add_argument("--test-lease", action="store_true")
+    parser.add_argument("--expect-deepseek", action="store_true")
+    parser.add_argument(
+        "--deepseek-model",
+        choices=("deepseek-v4-flash", "deepseek-v4-pro"),
+        default="deepseek-v4-flash",
+    )
     options = parser.parse_args()
     base_url = options.base_url.rstrip("/")
     parsed_base_url = urlsplit(base_url)
@@ -204,8 +230,27 @@ def main() -> None:
     config = request_json(f"{base_url}/api/config")
     assert health["provider"] == "google", health
     assert config["provider"] == "google", config
-    assert "services" not in config and "providers" not in config, config
-    print("google_only_contract=passed", flush=True)
+    assert "services" not in config, config
+    providers = {provider["id"]: provider for provider in config["providers"]}
+    assert set(providers) == {"google", "deepseek"}, providers
+    assert providers["google"]["available"] is True, providers["google"]
+    deepseek = providers["deepseek"]
+    assert isinstance(deepseek["available"], bool), deepseek
+    assert deepseek["defaultModel"] == "deepseek-v4-flash", deepseek
+    assert [model["id"] for model in deepseek["models"]] == [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+    ], deepseek
+    assert deepseek["thinkingModes"] == ["enabled", "disabled"], deepseek
+    assert deepseek["reasoningEfforts"] == ["low", "high", "max"], deepseek
+    assert deepseek["defaultReasoningEffort"] == "high", deepseek
+    assert "apiKey" not in json.dumps(config), config
+    if options.expect_deepseek:
+        assert deepseek["available"] is True, deepseek
+    print(
+        f"provider_contract=passed deepseek_available={deepseek['available']}",
+        flush=True,
+    )
 
     # A release/cancel beacon can beat the matching upload POST when a page is
     # closed immediately. Both UUIDs must be durably retired before any work
@@ -344,6 +389,41 @@ def main() -> None:
     ):
         raise RuntimeError("completed job exposed no PDF artifacts")
     print("successful_translation_and_download=passed", flush=True)
+
+    if options.expect_deepseek:
+        deepseek_job = submit(
+            base_url,
+            options.short_pdf,
+            pages="1",
+            provider="deepseek",
+            deepseek_model=options.deepseek_model,
+            deepseek_thinking_mode="disabled",
+        )
+        deepseek_result = wait_for_status(
+            base_url,
+            deepseek_job["id"],
+            {"succeeded"},
+            options.finish_timeout,
+        )
+        if deepseek_result.get("options", {}).get("provider") != "deepseek":
+            raise RuntimeError(
+                f"DeepSeek job lost its provider snapshot: {deepseek_result}"
+            )
+        if deepseek_result.get("files", {}).get("mono"):
+            assert_download(base_url, deepseek_job["id"], "mono")
+        elif deepseek_result.get("files", {}).get("dual"):
+            assert_download(base_url, deepseek_job["id"], "dual")
+        else:
+            raise RuntimeError("DeepSeek job exposed no PDF artifacts")
+        expect_status(
+            204,
+            f"{base_url}/api/jobs/{deepseek_job['id']}",
+            method="DELETE",
+        )
+        print(
+            f"deepseek_live_translation={options.deepseek_model}=passed",
+            flush=True,
+        )
 
     # Terminal release is recoverable during the grace period. Explicit DELETE
     # is the irreversible cleanup operation and leaves an ID tombstone.

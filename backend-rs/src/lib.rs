@@ -49,6 +49,8 @@ const MAX_FIELD_BYTES: usize = 1024;
 const MAX_INTERNAL_EVENT_BYTES: usize = 256 * 1024;
 const PRESTART_TOMBSTONE_RETENTION: Duration = Duration::from_secs(15 * 60);
 const PRESTART_TOMBSTONE_CAPACITY: usize = 4096;
+const DEEPSEEK_MODEL_FLASH: &str = "deepseek-v4-flash";
+const DEEPSEEK_MODEL_PRO: &str = "deepseek-v4-pro";
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -172,6 +174,38 @@ pub struct JobFiles {
     pub glossary: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub enum TranslationProvider {
+    #[default]
+    #[serde(rename = "google")]
+    Google,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum DeepSeekModel {
+    #[serde(rename = "deepseek-v4-flash")]
+    V4Flash,
+    #[serde(rename = "deepseek-v4-pro")]
+    V4Pro,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeepSeekThinkingMode {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeepSeekReasoningEffort {
+    Low,
+    High,
+    Max,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobOptions {
@@ -180,6 +214,14 @@ pub struct JobOptions {
     pub pages: Option<String>,
     pub output_mono: bool,
     pub output_dual: bool,
+    #[serde(default)]
+    pub provider: TranslationProvider,
+    #[serde(default)]
+    pub deepseek_model: Option<DeepSeekModel>,
+    #[serde(default)]
+    pub deepseek_thinking_mode: Option<DeepSeekThinkingMode>,
+    #[serde(default)]
+    pub deepseek_reasoning_effort: Option<DeepSeekReasoningEffort>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -659,7 +701,7 @@ impl AppState {
         loop {
             if let Some(health) = fetch_worker_health(self).await
                 && health.status == "ok"
-                && health.provider == "google"
+                && health.supports_provider("google")
             {
                 *self.0.worker_epoch.write().await = Some(health.epoch.clone());
                 info!(epoch = %health.epoch, "connected to Python worker epoch");
@@ -837,18 +879,59 @@ struct HealthResponse {
 #[derive(Deserialize)]
 struct WorkerHealth {
     status: String,
-    provider: String,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    providers: Vec<String>,
     active_jobs: usize,
     accepting_jobs: bool,
     epoch: String,
+}
+
+impl WorkerHealth {
+    fn supports_provider(&self, provider: &str) -> bool {
+        self.provider.as_deref() == Some(provider)
+            || self.providers.iter().any(|candidate| candidate == provider)
+    }
+
+    fn is_ready(&self, concurrency: usize) -> bool {
+        self.status == "ok"
+            && self.supports_provider("google")
+            && self.accepting_jobs
+            && self.active_jobs <= concurrency
+    }
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PublicConfig {
     provider: &'static str,
+    providers: Vec<ProviderDescriptor>,
     languages: Vec<Language>,
     max_upload_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderDescriptor {
+    id: &'static str,
+    name: &'static str,
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable_reason: Option<&'static str>,
+    models: Vec<ProviderModelDescriptor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_model: Option<&'static str>,
+    thinking_modes: Vec<&'static str>,
+    reasoning_efforts: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_reasoning_effort: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct ProviderModelDescriptor {
+    id: &'static str,
+    name: &'static str,
 }
 
 #[derive(Serialize)]
@@ -922,13 +1005,18 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
 }
 
 async fn worker_is_ready(state: &AppState) -> bool {
+    worker_is_ready_for_provider(state, TranslationProvider::Google).await
+}
+
+async fn worker_is_ready_for_provider(state: &AppState, provider: TranslationProvider) -> bool {
     let Some(health) = fetch_worker_health(state).await else {
         return false;
     };
-    let ready = health.status == "ok"
-        && health.provider == "google"
-        && health.accepting_jobs
-        && health.active_jobs <= state.0.config.concurrency;
+    let ready = health.is_ready(state.0.config.concurrency)
+        && match provider {
+            TranslationProvider::Google => true,
+            TranslationProvider::DeepSeek => health.supports_provider("deepseek"),
+        };
     if ready {
         *state.0.worker_epoch.write().await = Some(health.epoch);
     }
@@ -952,8 +1040,10 @@ async fn fetch_worker_health(state: &AppState) -> Option<WorkerHealth> {
 }
 
 async fn public_config(State(state): State<AppState>) -> Json<PublicConfig> {
+    let worker_health = fetch_worker_health(&state).await;
     Json(PublicConfig {
         provider: "google",
+        providers: public_provider_descriptors(worker_health.as_ref(), state.0.config.concurrency),
         max_upload_bytes: state.0.config.max_upload_bytes,
         languages: vec![
             Language {
@@ -1008,6 +1098,57 @@ async fn public_config(State(state): State<AppState>) -> Json<PublicConfig> {
     })
 }
 
+fn public_provider_descriptors(
+    health: Option<&WorkerHealth>,
+    _concurrency: usize,
+) -> Vec<ProviderDescriptor> {
+    // Provider availability describes configuration/capability, not a
+    // transient drain or a currently occupied worker slot. Admission and
+    // readiness are checked again when the job is created.
+    let google_available =
+        health.is_some_and(|health| health.status == "ok" && health.supports_provider("google"));
+    let deepseek_available =
+        health.is_some_and(|health| health.status == "ok" && health.supports_provider("deepseek"));
+    let worker_available = health.is_some_and(|health| health.status == "ok");
+    vec![
+        ProviderDescriptor {
+            id: "google",
+            name: "Google",
+            available: google_available,
+            unavailable_reason: (!google_available).then_some("worker_unavailable"),
+            models: Vec::new(),
+            default_model: None,
+            thinking_modes: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+        },
+        ProviderDescriptor {
+            id: "deepseek",
+            name: "DeepSeek",
+            available: deepseek_available,
+            unavailable_reason: (!deepseek_available).then_some(if worker_available {
+                "not_configured"
+            } else {
+                "worker_unavailable"
+            }),
+            models: vec![
+                ProviderModelDescriptor {
+                    id: DEEPSEEK_MODEL_FLASH,
+                    name: "DeepSeek V4 Flash",
+                },
+                ProviderModelDescriptor {
+                    id: DEEPSEEK_MODEL_PRO,
+                    name: "DeepSeek V4 Pro",
+                },
+            ],
+            default_model: Some(DEEPSEEK_MODEL_FLASH),
+            thinking_modes: vec!["enabled", "disabled"],
+            reasoning_efforts: vec!["low", "high", "max"],
+            default_reasoning_effort: Some("high"),
+        },
+    ]
+}
+
 #[derive(Default)]
 struct PendingUpload {
     filename: Option<String>,
@@ -1016,6 +1157,10 @@ struct PendingUpload {
     pages: Option<String>,
     output_mono: Option<bool>,
     output_dual: Option<bool>,
+    provider: Option<String>,
+    deepseek_model: Option<String>,
+    deepseek_thinking_mode: Option<String>,
+    deepseek_reasoning_effort: Option<String>,
     saw_file: bool,
 }
 
@@ -1137,6 +1282,10 @@ async fn create_job(
             return Err(error);
         }
     };
+    if !worker_is_ready_for_provider(&state, options.provider).await {
+        safe_remove_job_dir(&state, id).await;
+        return Err(ApiError::Unavailable);
+    }
     let filename = pending
         .filename
         .unwrap_or_else(|| "document.pdf".to_owned());
@@ -1274,7 +1423,15 @@ async fn receive_upload(
         } else {
             if !matches!(
                 name.as_str(),
-                "source_lang" | "target_lang" | "pages" | "output_mono" | "output_dual"
+                "source_lang"
+                    | "target_lang"
+                    | "pages"
+                    | "output_mono"
+                    | "output_dual"
+                    | "provider"
+                    | "deepseek_model"
+                    | "deepseek_thinking_mode"
+                    | "deepseek_reasoning_effort"
             ) {
                 return Err(ApiError::BadRequest("包含未知的表单字段".to_owned()));
             }
@@ -1285,6 +1442,10 @@ async fn receive_upload(
                 "pages" => pending.pages = Some(value),
                 "output_mono" => pending.output_mono = Some(parse_bool(&value)?),
                 "output_dual" => pending.output_dual = Some(parse_bool(&value)?),
+                "provider" => pending.provider = Some(value),
+                "deepseek_model" => pending.deepseek_model = Some(value),
+                "deepseek_thinking_mode" => pending.deepseek_thinking_mode = Some(value),
+                "deepseek_reasoning_effort" => pending.deepseek_reasoning_effort = Some(value),
                 _ => unreachable!("unknown multipart fields were rejected above"),
             }
         }
@@ -1345,13 +1506,83 @@ fn validate_upload_options(pending: &PendingUpload) -> Result<JobOptions, ApiErr
     if !output_mono && !output_dual {
         return Err(ApiError::BadRequest("至少选择一种输出文件".to_owned()));
     }
+    let provider = match nonblank(pending.provider.as_deref()) {
+        None | Some("google") => TranslationProvider::Google,
+        Some("deepseek") => TranslationProvider::DeepSeek,
+        Some(_) => return Err(ApiError::BadRequest("不支持该翻译渠道".to_owned())),
+    };
+    let requested_model = nonblank(pending.deepseek_model.as_deref());
+    let requested_thinking_mode = nonblank(pending.deepseek_thinking_mode.as_deref());
+    let requested_reasoning_effort = nonblank(pending.deepseek_reasoning_effort.as_deref());
+    let (deepseek_model, deepseek_thinking_mode, deepseek_reasoning_effort) = match provider {
+        TranslationProvider::Google => {
+            if requested_model.is_some()
+                || requested_thinking_mode.is_some()
+                || requested_reasoning_effort.is_some()
+            {
+                return Err(ApiError::BadRequest(
+                    "Google 任务不能包含 DeepSeek 选项".to_owned(),
+                ));
+            }
+            (None, None, None)
+        }
+        TranslationProvider::DeepSeek => {
+            let model = match requested_model {
+                None | Some(DEEPSEEK_MODEL_FLASH) => DeepSeekModel::V4Flash,
+                Some(DEEPSEEK_MODEL_PRO) => DeepSeekModel::V4Pro,
+                Some(_) => {
+                    return Err(ApiError::BadRequest("不支持该 DeepSeek 模型".to_owned()));
+                }
+            };
+            let thinking_mode = match requested_thinking_mode {
+                None => None,
+                Some("enabled") => Some(DeepSeekThinkingMode::Enabled),
+                Some("disabled") => Some(DeepSeekThinkingMode::Disabled),
+                Some(_) => {
+                    return Err(ApiError::BadRequest(
+                        "DeepSeek 思考模式必须为 enabled 或 disabled".to_owned(),
+                    ));
+                }
+            };
+            let reasoning_effort = match requested_reasoning_effort {
+                None => None,
+                Some("low") => Some(DeepSeekReasoningEffort::Low),
+                Some("high") => Some(DeepSeekReasoningEffort::High),
+                Some("max") => Some(DeepSeekReasoningEffort::Max),
+                Some(_) => {
+                    return Err(ApiError::BadRequest(
+                        "DeepSeek 推理强度必须为 low、high 或 max".to_owned(),
+                    ));
+                }
+            };
+            if reasoning_effort.is_some() && thinking_mode != Some(DeepSeekThinkingMode::Enabled) {
+                return Err(ApiError::BadRequest(
+                    "只有显式启用 DeepSeek 思考模式时才能设置推理强度".to_owned(),
+                ));
+            }
+            let reasoning_effort = if thinking_mode == Some(DeepSeekThinkingMode::Enabled) {
+                Some(reasoning_effort.unwrap_or(DeepSeekReasoningEffort::High))
+            } else {
+                None
+            };
+            (Some(model), thinking_mode, reasoning_effort)
+        }
+    };
     Ok(JobOptions {
         source_lang,
         target_lang,
         pages,
         output_mono,
         output_dual,
+        provider,
+        deepseek_model,
+        deepseek_thinking_mode,
+        deepseek_reasoning_effort,
     })
+}
+
+fn nonblank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn normalize_pages(value: Option<&str>) -> Result<Option<String>, ApiError> {
@@ -1690,6 +1921,10 @@ struct WorkerRequest {
     pages: Option<String>,
     output_mono: bool,
     output_dual: bool,
+    provider: TranslationProvider,
+    deepseek_model: Option<DeepSeekModel>,
+    deepseek_thinking_mode: Option<DeepSeekThinkingMode>,
+    deepseek_reasoning_effort: Option<DeepSeekReasoningEffort>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1798,6 +2033,10 @@ async fn run_job(state: AppState, entry: Arc<JobEntry>) {
         pages: snapshot.options.pages.clone(),
         output_mono: snapshot.options.output_mono,
         output_dual: snapshot.options.output_dual,
+        provider: snapshot.options.provider,
+        deepseek_model: snapshot.options.deepseek_model,
+        deepseek_thinking_mode: snapshot.options.deepseek_thinking_mode,
+        deepseek_reasoning_effort: snapshot.options.deepseek_reasoning_effort,
     };
 
     match start_worker_job(&state, id, &request).await {
@@ -1839,7 +2078,11 @@ async fn run_job(state: AppState, entry: Arc<JobEntry>) {
         if !entry.cancellation.is_cancelled() {
             snapshot.status = JobStatus::Running;
             snapshot.stage = "准备文档".to_owned();
-            snapshot.message = "Google 翻译引擎已启动".to_owned();
+            snapshot.message = match snapshot.options.provider {
+                TranslationProvider::Google => "Google 翻译引擎已启动",
+                TranslationProvider::DeepSeek => "DeepSeek V4 翻译引擎已启动",
+            }
+            .to_owned();
         }
     })
     .await;
@@ -1984,7 +2227,7 @@ async fn force_recycle_worker(state: &AppState, id: Uuid) -> WorkerTerminal {
 
     let current_epoch = fetch_worker_health(state)
         .await
-        .filter(|health| health.status == "ok" && health.provider == "google")
+        .filter(|health| health.status == "ok" && health.supports_provider("google"))
         .map(|health| health.epoch);
     if current_epoch.as_deref() == previous_epoch.as_deref() || current_epoch.is_none() {
         request_worker_fail_stop(state).await;
@@ -1997,7 +2240,7 @@ async fn force_recycle_worker(state: &AppState, id: Uuid) -> WorkerTerminal {
         }
         if let Some(health) = fetch_worker_health(state).await
             && health.status == "ok"
-            && health.provider == "google"
+            && health.supports_provider("google")
             && Some(health.epoch.as_str()) != previous_epoch.as_deref()
         {
             info!(%id, epoch = %health.epoch, "new Python worker epoch confirmed");
@@ -2638,6 +2881,10 @@ mod tests {
         let options = validate_upload_options(&upload).unwrap();
         assert_eq!(options.source_lang, "auto");
         assert_eq!(options.target_lang, "zh");
+        assert_eq!(options.provider, TranslationProvider::Google);
+        assert_eq!(options.deepseek_model, None);
+        assert_eq!(options.deepseek_thinking_mode, None);
+        assert_eq!(options.deepseek_reasoning_effort, None);
 
         let invalid = PendingUpload {
             source_lang: Some("en".to_owned()),
@@ -2645,6 +2892,246 @@ mod tests {
             ..PendingUpload::default()
         };
         assert!(validate_upload_options(&invalid).is_err());
+    }
+
+    #[test]
+    fn deepseek_upload_options_are_strictly_validated_and_normalized() {
+        let defaults = validate_upload_options(&PendingUpload {
+            provider: Some("deepseek".to_owned()),
+            ..PendingUpload::default()
+        })
+        .unwrap();
+        assert_eq!(defaults.provider, TranslationProvider::DeepSeek);
+        assert_eq!(defaults.deepseek_model, Some(DeepSeekModel::V4Flash));
+        assert_eq!(defaults.deepseek_thinking_mode, None);
+        assert_eq!(defaults.deepseek_reasoning_effort, None);
+
+        let enabled_defaults = validate_upload_options(&PendingUpload {
+            provider: Some("deepseek".to_owned()),
+            deepseek_model: Some(DEEPSEEK_MODEL_PRO.to_owned()),
+            deepseek_thinking_mode: Some("enabled".to_owned()),
+            ..PendingUpload::default()
+        })
+        .unwrap();
+        assert_eq!(enabled_defaults.deepseek_model, Some(DeepSeekModel::V4Pro));
+        assert_eq!(
+            enabled_defaults.deepseek_thinking_mode,
+            Some(DeepSeekThinkingMode::Enabled)
+        );
+        assert_eq!(
+            enabled_defaults.deepseek_reasoning_effort,
+            Some(DeepSeekReasoningEffort::High)
+        );
+        let disabled = validate_upload_options(&PendingUpload {
+            provider: Some("deepseek".to_owned()),
+            deepseek_thinking_mode: Some("disabled".to_owned()),
+            ..PendingUpload::default()
+        })
+        .unwrap();
+        assert_eq!(
+            disabled.deepseek_thinking_mode,
+            Some(DeepSeekThinkingMode::Disabled)
+        );
+        assert_eq!(disabled.deepseek_reasoning_effort, None);
+        let worker_payload = serde_json::to_value(WorkerRequest {
+            input_path: "/data/input.pdf".to_owned(),
+            output_dir: "/data/output".to_owned(),
+            source_lang: enabled_defaults.source_lang.clone(),
+            target_lang: enabled_defaults.target_lang.clone(),
+            pages: enabled_defaults.pages.clone(),
+            output_mono: enabled_defaults.output_mono,
+            output_dual: enabled_defaults.output_dual,
+            provider: enabled_defaults.provider,
+            deepseek_model: enabled_defaults.deepseek_model,
+            deepseek_thinking_mode: enabled_defaults.deepseek_thinking_mode,
+            deepseek_reasoning_effort: enabled_defaults.deepseek_reasoning_effort,
+        })
+        .unwrap();
+        assert_eq!(worker_payload["provider"], "deepseek");
+        assert_eq!(worker_payload["deepseek_model"], DEEPSEEK_MODEL_PRO);
+        assert_eq!(worker_payload["deepseek_thinking_mode"], "enabled");
+        assert_eq!(worker_payload["deepseek_reasoning_effort"], "high");
+
+        for (effort, expected) in [
+            ("low", DeepSeekReasoningEffort::Low),
+            ("high", DeepSeekReasoningEffort::High),
+            ("max", DeepSeekReasoningEffort::Max),
+        ] {
+            let options = validate_upload_options(&PendingUpload {
+                provider: Some("deepseek".to_owned()),
+                deepseek_thinking_mode: Some("enabled".to_owned()),
+                deepseek_reasoning_effort: Some(effort.to_owned()),
+                ..PendingUpload::default()
+            })
+            .unwrap();
+            assert_eq!(options.deepseek_reasoning_effort, Some(expected));
+        }
+
+        for invalid in [
+            PendingUpload {
+                provider: Some("deepseek".to_owned()),
+                deepseek_model: Some("deepseek-v5".to_owned()),
+                ..PendingUpload::default()
+            },
+            PendingUpload {
+                provider: Some("deepseek".to_owned()),
+                deepseek_thinking_mode: Some("auto".to_owned()),
+                ..PendingUpload::default()
+            },
+            PendingUpload {
+                provider: Some("deepseek".to_owned()),
+                deepseek_reasoning_effort: Some("high".to_owned()),
+                ..PendingUpload::default()
+            },
+            PendingUpload {
+                provider: Some("deepseek".to_owned()),
+                deepseek_thinking_mode: Some("disabled".to_owned()),
+                deepseek_reasoning_effort: Some("max".to_owned()),
+                ..PendingUpload::default()
+            },
+            PendingUpload {
+                provider: Some("google".to_owned()),
+                deepseek_model: Some(DEEPSEEK_MODEL_FLASH.to_owned()),
+                ..PendingUpload::default()
+            },
+            PendingUpload {
+                provider: Some("unknown".to_owned()),
+                ..PendingUpload::default()
+            },
+        ] {
+            assert!(validate_upload_options(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_persisted_snapshot_defaults_to_google() {
+        let snapshot = JobSnapshot::queued(
+            Uuid::new_v4(),
+            "paper.pdf".to_owned(),
+            JobOptions {
+                source_lang: "auto".to_owned(),
+                target_lang: "zh".to_owned(),
+                pages: None,
+                output_mono: true,
+                output_dual: true,
+                provider: TranslationProvider::Google,
+                deepseek_model: None,
+                deepseek_thinking_mode: None,
+                deepseek_reasoning_effort: None,
+            },
+        );
+        let mut persisted = serde_json::to_value(snapshot).unwrap();
+        let persisted_options = persisted
+            .get_mut("options")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        persisted_options.remove("provider");
+        persisted_options.remove("deepseekModel");
+        persisted_options.remove("deepseekThinkingMode");
+        persisted_options.remove("deepseekReasoningEffort");
+
+        let restored: JobSnapshot = serde_json::from_value(persisted).unwrap();
+        assert_eq!(restored.options.provider, TranslationProvider::Google);
+        assert_eq!(restored.options.deepseek_model, None);
+        assert_eq!(restored.options.deepseek_thinking_mode, None);
+        assert_eq!(restored.options.deepseek_reasoning_effort, None);
+    }
+
+    #[test]
+    fn worker_health_capabilities_drive_public_provider_config() {
+        let legacy: WorkerHealth = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "provider": "google",
+            "active_jobs": 0,
+            "accepting_jobs": true,
+            "epoch": "legacy"
+        }))
+        .unwrap();
+        assert!(legacy.is_ready(1));
+        assert!(legacy.supports_provider("google"));
+        assert!(!legacy.supports_provider("deepseek"));
+
+        let capable: WorkerHealth = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "providers": ["google", "deepseek"],
+            "active_jobs": 0,
+            "accepting_jobs": true,
+            "epoch": "capable"
+        }))
+        .unwrap();
+        assert!(capable.is_ready(1));
+        assert!(capable.supports_provider("google"));
+        assert!(capable.supports_provider("deepseek"));
+
+        let descriptors = public_provider_descriptors(Some(&capable), 1);
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].id, "google");
+        assert!(descriptors[0].available);
+        assert!(descriptors[0].models.is_empty());
+        let deepseek = &descriptors[1];
+        assert_eq!(deepseek.id, "deepseek");
+        assert!(deepseek.available);
+        assert_eq!(deepseek.unavailable_reason, None);
+        assert_eq!(deepseek.default_model, Some(DEEPSEEK_MODEL_FLASH));
+        assert_eq!(
+            deepseek
+                .models
+                .iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            vec![DEEPSEEK_MODEL_FLASH, DEEPSEEK_MODEL_PRO]
+        );
+        assert_eq!(deepseek.reasoning_efforts, vec!["low", "high", "max"]);
+        assert_eq!(deepseek.default_reasoning_effort, Some("high"));
+
+        let draining: WorkerHealth = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "providers": ["google", "deepseek"],
+            "active_jobs": 1,
+            "accepting_jobs": false,
+            "epoch": "draining"
+        }))
+        .unwrap();
+        assert!(!draining.is_ready(1));
+        assert!(
+            public_provider_descriptors(Some(&draining), 1)
+                .iter()
+                .all(|provider| provider.available)
+        );
+
+        let unavailable = public_provider_descriptors(None, 1);
+        assert!(unavailable.iter().all(|provider| !provider.available));
+        assert!(
+            unavailable
+                .iter()
+                .all(|provider| provider.unavailable_reason == Some("worker_unavailable"))
+        );
+        let legacy_descriptors = public_provider_descriptors(Some(&legacy), 1);
+        assert_eq!(
+            legacy_descriptors[1].unavailable_reason,
+            Some("not_configured")
+        );
+        let public_config = serde_json::to_value(PublicConfig {
+            provider: "google",
+            providers: descriptors,
+            languages: Vec::new(),
+            max_upload_bytes: 1024,
+        })
+        .unwrap();
+        assert_eq!(public_config["provider"], "google");
+        assert_eq!(
+            public_config["providers"][1]["defaultModel"],
+            DEEPSEEK_MODEL_FLASH
+        );
+        assert_eq!(
+            public_config["providers"][1]["defaultReasoningEffort"],
+            "high"
+        );
+        let public_json = public_config.to_string();
+        assert!(!public_json.contains("token"));
+        assert!(!public_json.contains("secret"));
+        assert!(!public_json.contains("apiKey"));
     }
 
     #[test]
@@ -2668,6 +3155,10 @@ mod tests {
                 pages: None,
                 output_mono: true,
                 output_dual: true,
+                provider: TranslationProvider::Google,
+                deepseek_model: None,
+                deepseek_thinking_mode: None,
+                deepseek_reasoning_effort: None,
             },
         );
         persistence.save(&good).await.unwrap();
@@ -2726,6 +3217,10 @@ mod tests {
                 pages: None,
                 output_mono: true,
                 output_dual: true,
+                provider: TranslationProvider::Google,
+                deepseek_model: None,
+                deepseek_thinking_mode: None,
+                deepseek_reasoning_effort: None,
             },
         );
         persistence.save(&snapshot).await.unwrap();
@@ -2753,6 +3248,10 @@ mod tests {
                 pages: None,
                 output_mono: true,
                 output_dual: true,
+                provider: TranslationProvider::Google,
+                deepseek_model: None,
+                deepseek_thinking_mode: None,
+                deepseek_reasoning_effort: None,
             },
         );
         persistence.save(&snapshot).await.unwrap();
@@ -2857,6 +3356,10 @@ mod tests {
                 pages: None,
                 output_mono: true,
                 output_dual: true,
+                provider: TranslationProvider::Google,
+                deepseek_model: None,
+                deepseek_thinking_mode: None,
+                deepseek_reasoning_effort: None,
             },
         );
         snapshot.status = JobStatus::Cancelled;
@@ -2935,6 +3438,72 @@ mod tests {
 
     async fn mock_resume() -> Json<serde_json::Value> {
         Json(serde_json::json!({"status": "ready", "active_jobs": 0}))
+    }
+
+    #[tokio::test]
+    async fn deepseek_create_is_rejected_when_worker_lacks_capability() {
+        let mock_app = Router::new()
+            .route("/internal/health", get(mock_health))
+            .route("/internal/drain", post(mock_drain))
+            .route("/internal/resume", post(mock_resume));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("jobs");
+        let state = AppState::new(AppConfig {
+            port: 0,
+            data_root: data_root.clone(),
+            state_root: temp.path().join("state"),
+            frontend_dir: temp.path().join("frontend"),
+            worker_url: format!("http://{address}"),
+            worker_token: "test-token".to_owned(),
+            max_upload_bytes: 1024 * 1024,
+            upload_timeout: Duration::from_secs(60),
+            concurrency: 1,
+            max_active_jobs: 8,
+            lease_timeout: Duration::from_secs(60),
+            release_grace: Duration::from_secs(10),
+            cancel_reconcile_timeout: Duration::from_secs(30),
+            worker_recycle_timeout: Duration::from_secs(60),
+            terminal_retention: Duration::from_secs(60),
+            id_tombstone_retention: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+        let id = Uuid::new_v4();
+        let body = concat!(
+            "--deepseek-boundary\r\n",
+            "Content-Disposition: form-data; name=\"provider\"\r\n\r\n",
+            "deepseek\r\n",
+            "--deepseek-boundary\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"paper.pdf\"\r\n",
+            "Content-Type: application/pdf\r\n\r\n",
+            "%PDF-1.7\n",
+            "\r\n--deepseek-boundary--\r\n"
+        );
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs")
+                    .header("x-job-id", id.to_string())
+                    .header(
+                        CONTENT_TYPE,
+                        "multipart/form-data; boundary=deepseek-boundary",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!state.0.jobs.read().await.contains_key(&id));
+        assert!(!data_root.join(id.to_string()).exists());
+        server.abort();
     }
 
     #[tokio::test]
@@ -3134,6 +3703,10 @@ mod tests {
                 pages: None,
                 output_mono: true,
                 output_dual: true,
+                provider: TranslationProvider::Google,
+                deepseek_model: None,
+                deepseek_thinking_mode: None,
+                deepseek_reasoning_effort: None,
             },
         );
         state.0.persistence.save(&snapshot).await.unwrap();
@@ -3215,6 +3788,10 @@ mod tests {
                 pages: None,
                 output_mono: true,
                 output_dual: true,
+                provider: TranslationProvider::Google,
+                deepseek_model: None,
+                deepseek_thinking_mode: None,
+                deepseek_reasoning_effort: None,
             },
         );
         state.0.persistence.save(&snapshot).await.unwrap();
@@ -3291,6 +3868,10 @@ mod tests {
                 pages: None,
                 output_mono: true,
                 output_dual: true,
+                provider: TranslationProvider::Google,
+                deepseek_model: None,
+                deepseek_thinking_mode: None,
+                deepseek_reasoning_effort: None,
             },
         );
         let entry = JobEntry::new(snapshot, job_dir);

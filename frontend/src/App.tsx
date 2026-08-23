@@ -32,9 +32,15 @@ import {
 import { checkHealth, getConfig, jobFileUrl } from "./api";
 import type {
   AppConfig,
+  DeepSeekModel,
+  DeepSeekReasoningEffort,
+  DeepSeekThinkingMode,
   JobDraft,
   JobStatus,
   PersistedDraft,
+  ProviderDescriptor,
+  ProviderId,
+  ProviderModelOption,
   TranslationJob,
 } from "./types";
 import { ACTIVE_JOB_STATES } from "./types";
@@ -43,6 +49,23 @@ import { useTranslationJob } from "./useTranslationJob";
 const DRAFT_STORAGE_KEY = "pdf2zh.translation-draft";
 const FALLBACK_CONFIG: AppConfig = {
   provider: "google",
+  providers: [
+    { id: "google", name: "Google", available: true },
+    {
+      id: "deepseek",
+      name: "DeepSeek",
+      available: false,
+      unavailableReason: "not_configured",
+      models: [
+        { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+        { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" },
+      ],
+      defaultModel: "deepseek-v4-flash",
+      thinkingModes: ["enabled", "disabled"],
+      reasoningEfforts: ["low", "high", "max"],
+      defaultReasoningEffort: "high",
+    },
+  ],
   maxUploadBytes: 100 * 1024 * 1024,
   languages: [
     { code: "en", name: "英语" },
@@ -56,13 +79,118 @@ const FALLBACK_CONFIG: AppConfig = {
   ],
 };
 
+const CURRENT_DEEPSEEK_MODELS: ProviderModelOption[] = [
+  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+  { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" },
+];
+const CURRENT_DEEPSEEK_THINKING_MODES: DeepSeekThinkingMode[] = [
+  "enabled",
+  "disabled",
+];
+const CURRENT_DEEPSEEK_REASONING_EFFORTS: DeepSeekReasoningEffort[] = [
+  "low",
+  "high",
+  "max",
+];
+
 const DEFAULT_DRAFT: JobDraft = {
+  provider: "google",
+  deepseekModel: "deepseek-v4-flash",
+  deepseekThinkingMode: "",
+  deepseekReasoningEffort: "high",
   sourceLang: "en",
   targetLang: "zh",
   pages: "",
   outputMono: true,
   outputDual: true,
 };
+
+function isDeepSeekModel(value: unknown): value is DeepSeekModel {
+  return value === "deepseek-v4-flash" || value === "deepseek-v4-pro";
+}
+
+function isDeepSeekThinkingMode(
+  value: unknown,
+): value is Exclude<DeepSeekThinkingMode, ""> {
+  return value === "enabled" || value === "disabled";
+}
+
+function isDeepSeekReasoningEffort(
+  value: unknown,
+): value is DeepSeekReasoningEffort {
+  return value === "low" || value === "high" || value === "max";
+}
+
+function normalizeProviders(config: AppConfig): ProviderDescriptor[] {
+  const configured = new Map(
+    (config.providers ?? []).map((provider) => [provider.id, provider]),
+  );
+  const google = configured.get("google");
+  const deepseek = configured.get("deepseek");
+  const advertisedModels = (deepseek?.models ?? []).filter(
+    (model): model is ProviderModelOption & { id: DeepSeekModel } =>
+      isDeepSeekModel(model.id),
+  );
+  const deepseekModels = advertisedModels.length
+    ? advertisedModels
+    : CURRENT_DEEPSEEK_MODELS;
+  const advertisedDefault = deepseek?.defaultModel;
+  const defaultModel =
+    isDeepSeekModel(advertisedDefault) &&
+    deepseekModels.some((model) => model.id === advertisedDefault)
+      ? advertisedDefault
+      : deepseekModels[0]?.id ?? "deepseek-v4-flash";
+  const advertisedThinkingModes = (deepseek?.thinkingModes ?? []).filter(
+    isDeepSeekThinkingMode,
+  );
+  const thinkingModes = advertisedThinkingModes.length
+    ? advertisedThinkingModes
+    : CURRENT_DEEPSEEK_THINKING_MODES;
+  const advertisedReasoningEfforts = (deepseek?.reasoningEfforts ?? []).filter(
+    isDeepSeekReasoningEffort,
+  );
+  const reasoningEfforts = advertisedReasoningEfforts.length
+    ? advertisedReasoningEfforts
+    : CURRENT_DEEPSEEK_REASONING_EFFORTS;
+  const defaultReasoningEffort =
+    isDeepSeekReasoningEffort(deepseek?.defaultReasoningEffort) &&
+    reasoningEfforts.includes(deepseek.defaultReasoningEffort)
+      ? deepseek.defaultReasoningEffort
+      : reasoningEfforts.includes("high")
+        ? "high"
+        : reasoningEfforts[0] ?? "high";
+  const googleAvailable = google?.available ?? true;
+  const deepseekAvailable = deepseek?.available ?? false;
+
+  return [
+    {
+      id: "google",
+      name: google?.name || "Google",
+      available: googleAvailable,
+      unavailableReason: googleAvailable ? undefined : google?.unavailableReason,
+    },
+    {
+      id: "deepseek",
+      name: deepseek?.name || "DeepSeek",
+      available: deepseekAvailable,
+      unavailableReason: deepseekAvailable
+        ? undefined
+        : deepseek?.unavailableReason ?? "not_configured",
+      models: deepseekModels,
+      defaultModel,
+      thinkingModes,
+      reasoningEfforts,
+      defaultReasoningEffort,
+    },
+  ];
+}
+
+function unavailableProviderSuffix(provider: ProviderDescriptor): string {
+  if (provider.available) return "";
+  return provider.unavailableReason === "not_configured"
+    ? "（服务器未配置）"
+    : "（当前不可用）";
+}
 
 const STATUS_COPY: Record<
   JobStatus,
@@ -87,6 +215,20 @@ function loadDraft(): JobDraft {
     );
     return {
       ...draft,
+      provider: draft.provider === "deepseek" ? "deepseek" : "google",
+      deepseekModel: isDeepSeekModel(draft.deepseekModel)
+        ? draft.deepseekModel
+        : DEFAULT_DRAFT.deepseekModel,
+      deepseekThinkingMode:
+        draft.deepseekThinkingMode === "enabled" ||
+        draft.deepseekThinkingMode === "disabled"
+          ? draft.deepseekThinkingMode
+          : "",
+      deepseekReasoningEffort:
+        draft.deepseekReasoningEffort === "low" ||
+        draft.deepseekReasoningEffort === "max"
+          ? draft.deepseekReasoningEffort
+          : "high",
       sourceLang: fallbackCodes.has(draft.sourceLang)
         ? draft.sourceLang
         : DEFAULT_DRAFT.sourceLang,
@@ -415,48 +557,93 @@ export default function App() {
 
   useEffect(() => {
     let disposed = false;
-    void getConfig()
-      .then((serverConfig) => {
-        if (!disposed) {
-          setConfig(serverConfig);
-          setConfigWarning(null);
-          setDraft((current) => {
-            const codes = new Set(serverConfig.languages.map((language) => language.code));
-            const sourceLang = codes.has(current.sourceLang)
-              ? current.sourceLang
-              : codes.has("auto")
-                ? "auto"
-                : serverConfig.languages[0]?.code ?? "en";
-            const targetLang =
-              codes.has(current.targetLang) && current.targetLang !== "auto"
-                ? current.targetLang
-                : codes.has("zh")
-                  ? "zh"
-                  : codes.has("zh-CN")
-                    ? "zh-CN"
-                    : serverConfig.languages.find(
-                          (language) =>
-                            language.code !== "auto" && language.code !== sourceLang,
+    const refreshConfig = () => {
+      void getConfig()
+        .then((serverConfig) => {
+          if (!disposed) {
+            setConfig(serverConfig);
+            setConfigWarning(null);
+            setDraft((current) => {
+              const providers = normalizeProviders(serverConfig);
+              const provider = providers.some(
+                (candidate) => candidate.id === current.provider,
+              )
+                ? current.provider
+                : "google";
+              const deepseek = providers.find(
+                (candidate) => candidate.id === "deepseek",
+              );
+              const deepseekModels = deepseek?.models ?? CURRENT_DEEPSEEK_MODELS;
+              const deepseekModel = deepseekModels.some(
+                (model) => model.id === current.deepseekModel,
+              )
+                ? current.deepseekModel
+                : isDeepSeekModel(deepseek?.defaultModel)
+                  ? deepseek.defaultModel
+                  : DEFAULT_DRAFT.deepseekModel;
+              const deepseekThinkingModes =
+                deepseek?.thinkingModes ?? CURRENT_DEEPSEEK_THINKING_MODES;
+              const deepseekThinkingMode =
+                current.deepseekThinkingMode === "" ||
+                deepseekThinkingModes.includes(current.deepseekThinkingMode)
+                  ? current.deepseekThinkingMode
+                  : "";
+              const deepseekReasoningEfforts =
+                deepseek?.reasoningEfforts ?? CURRENT_DEEPSEEK_REASONING_EFFORTS;
+              const deepseekReasoningEffort = deepseekReasoningEfforts.includes(
+                current.deepseekReasoningEffort,
+              )
+                ? current.deepseekReasoningEffort
+                : isDeepSeekReasoningEffort(deepseek?.defaultReasoningEffort)
+                  ? deepseek.defaultReasoningEffort
+                  : DEFAULT_DRAFT.deepseekReasoningEffort;
+              const codes = new Set(
+                serverConfig.languages.map((language) => language.code),
+              );
+              const sourceLang = codes.has(current.sourceLang)
+                ? current.sourceLang
+                : codes.has("auto")
+                  ? "auto"
+                  : serverConfig.languages[0]?.code ?? "en";
+              const targetLang =
+                codes.has(current.targetLang) && current.targetLang !== "auto"
+                  ? current.targetLang
+                  : codes.has("zh")
+                    ? "zh"
+                    : codes.has("zh-CN")
+                      ? "zh-CN"
+                      : serverConfig.languages.find(
+                            (language) =>
+                              language.code !== "auto" &&
+                              language.code !== sourceLang,
+                          )?.code ??
+                        serverConfig.languages.find(
+                          (language) => language.code !== "auto",
                         )?.code ??
-                      serverConfig.languages.find(
-                        (language) => language.code !== "auto",
-                      )?.code ??
-                      "zh";
-            return {
-              ...current,
-              sourceLang,
-              targetLang,
-            };
-          });
-        }
-      })
-      .catch(() => {
-        if (!disposed) {
-          setConfigWarning("暂时无法读取服务配置，已显示默认语言列表。");
-        }
-      });
+                        "zh";
+              return {
+                ...current,
+                provider,
+                deepseekModel,
+                deepseekThinkingMode,
+                deepseekReasoningEffort,
+                sourceLang,
+                targetLang,
+              };
+            });
+          }
+        })
+        .catch(() => {
+          if (!disposed) {
+            setConfigWarning("暂时无法读取服务配置，已显示默认语言列表。");
+          }
+        });
+    };
+    refreshConfig();
+    const timer = window.setInterval(refreshConfig, 30_000);
     return () => {
       disposed = true;
+      window.clearInterval(timer);
     };
   }, []);
 
@@ -490,6 +677,26 @@ export default function App() {
     };
     window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(persisted));
   }, [draft, file?.name]);
+
+  const providers = useMemo(() => normalizeProviders(config), [config]);
+  const selectedProvider = providers.find(
+    (provider) => provider.id === draft.provider,
+  );
+  const deepseekProvider = providers.find(
+    (provider) => provider.id === "deepseek",
+  );
+  const deepseekModels = (deepseekProvider?.models ?? CURRENT_DEEPSEEK_MODELS).filter(
+    (model): model is ProviderModelOption & { id: DeepSeekModel } =>
+      isDeepSeekModel(model.id),
+  );
+  const deepseekThinkingModes = (
+    deepseekProvider?.thinkingModes ?? CURRENT_DEEPSEEK_THINKING_MODES
+  ).filter(isDeepSeekThinkingMode);
+  const deepseekReasoningEfforts = (
+    deepseekProvider?.reasoningEfforts ?? CURRENT_DEEPSEEK_REASONING_EFFORTS
+  ).filter(isDeepSeekReasoningEffort);
+  const providerName = selectedProvider?.name ??
+    (draft.provider === "deepseek" ? "DeepSeek" : "Google");
 
   const sourceName = useMemo(
     () => config.languages.find((item) => item.code === draft.sourceLang)?.name,
@@ -527,6 +734,11 @@ export default function App() {
     }
     if (file.size > config.maxUploadBytes) {
       return `文件超过 ${formatBytes(config.maxUploadBytes)} 上限。`;
+    }
+    if (!selectedProvider?.available) {
+      return selectedProvider?.unavailableReason === "not_configured"
+        ? `${providerName} 尚未在服务器配置。`
+        : `${providerName} 当前不可用，请稍后重试。`;
     }
     if (draft.sourceLang === draft.targetLang) {
       return "源语言和目标语言不能相同。";
@@ -588,7 +800,7 @@ export default function App() {
             <div>
               <div className="brand-line">
                 <h1 id="app-title">PDF 译稿</h1>
-                <span className="provider-pill">Google</span>
+                <span className="provider-pill">{providerName}</span>
               </div>
               <p>保留公式与版式的学术 PDF 翻译</p>
             </div>
@@ -690,8 +902,104 @@ export default function App() {
                 <span>02</span>
                 <div>
                   <h2>翻译设置</h2>
-                  <p>请确认语言和页码范围</p>
+                  <p>请确认渠道、语言和页码范围</p>
                 </div>
+              </div>
+
+              <div className="provider-settings">
+                <label className="field">
+                  <span>翻译渠道</span>
+                  <select
+                    aria-label="翻译渠道"
+                    value={draft.provider}
+                    onChange={(event) =>
+                      setDraft((current) => ({
+                        ...current,
+                        provider: event.target.value as ProviderId,
+                      }))
+                    }
+                  >
+                    {providers.map((provider) => (
+                      <option
+                        key={provider.id}
+                        value={provider.id}
+                        disabled={!provider.available}
+                      >
+                        {provider.name}
+                        {unavailableProviderSuffix(provider)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                {draft.provider === "deepseek" && (
+                  <div className="deepseek-settings" aria-label="DeepSeek 设置">
+                    <label className="field">
+                      <span>DeepSeek 模型</span>
+                      <select
+                        aria-label="DeepSeek 模型"
+                        value={draft.deepseekModel}
+                        onChange={(event) =>
+                          setDraft((current) => ({
+                            ...current,
+                            deepseekModel: event.target.value as DeepSeekModel,
+                          }))
+                        }
+                      >
+                        {deepseekModels.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="field">
+                      <span>Thinking 模式</span>
+                      <select
+                        aria-label="DeepSeek Thinking 模式"
+                        value={draft.deepseekThinkingMode}
+                        onChange={(event) =>
+                          setDraft((current) => ({
+                            ...current,
+                            deepseekThinkingMode: event.target
+                              .value as DeepSeekThinkingMode,
+                          }))
+                        }
+                      >
+                        <option value="">跟随官方默认（启用）</option>
+                        {deepseekThinkingModes.map((mode) => (
+                          <option key={mode} value={mode}>
+                            {mode === "enabled" ? "明确启用" : "明确关闭"}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    {draft.deepseekThinkingMode === "enabled" && (
+                      <label className="field">
+                        <span>推理强度</span>
+                        <select
+                          aria-label="DeepSeek 推理强度"
+                          value={draft.deepseekReasoningEffort}
+                          onChange={(event) =>
+                            setDraft((current) => ({
+                              ...current,
+                              deepseekReasoningEffort: event.target
+                                .value as DeepSeekReasoningEffort,
+                            }))
+                          }
+                        >
+                          {deepseekReasoningEfforts.map((effort) => (
+                            <option key={effort} value={effort}>
+                              {effort[0].toUpperCase() + effort.slice(1)}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="language-row">
@@ -866,7 +1174,7 @@ export default function App() {
       </section>
 
       <footer className="page-footer">
-        <span>翻译渠道：Google</span>
+        <span>翻译渠道：{providerName}</span>
         <span aria-hidden="true">·</span>
         <span>任务进度会自动保存</span>
       </footer>

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import threading
@@ -22,15 +23,21 @@ from fastapi import Depends
 from fastapi import FastAPI
 from fastapi import Header
 from fastapi import HTTPException
+from fastapi import Request
 from fastapi import status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
+from pydantic import model_validator
 
 from pdf2zh_next.config.model import PDFSettings
 from pdf2zh_next.config.model import SettingsModel
 from pdf2zh_next.config.model import TranslationSettings
+from pdf2zh_next.config.translate_engine_model import DeepSeekSettings
 from pdf2zh_next.config.translate_engine_model import GoogleSettings
 from pdf2zh_next.high_level import UnrecoverableCleanupError
 from pdf2zh_next.high_level import do_translate_async_stream
@@ -70,6 +77,11 @@ WORKER_EPOCH = str(uuid4())
 
 
 class TranslationRequest(BaseModel):
+    # This is an internal endpoint, and the Rust coordinator sends an exact
+    # schema. Silently dropping unknown fields also prevents an accidentally
+    # submitted API key from being echoed in FastAPI's 422 validation details.
+    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
+
     input_path: str
     output_dir: str
     source_lang: str = "auto"
@@ -77,6 +89,27 @@ class TranslationRequest(BaseModel):
     pages: str | None = Field(default=None, max_length=256)
     output_mono: bool = True
     output_dual: bool = True
+    provider: Literal["google", "deepseek"] = "google"
+    deepseek_model: Literal["deepseek-v4-flash", "deepseek-v4-pro"] | None = None
+    deepseek_thinking_mode: Literal["enabled", "disabled"] | None = None
+    deepseek_reasoning_effort: Literal["low", "high", "max"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_client_secret_fields(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        return {
+            key: item
+            for key, item in value.items()
+            if not (
+                isinstance(key, str)
+                and (
+                    "apikey" in key.lower().replace("_", "").replace("-", "")
+                    or "baseurl" in key.lower().replace("_", "").replace("-", "")
+                )
+            )
+        }
 
     @field_validator("source_lang", "target_lang")
     @classmethod
@@ -112,6 +145,28 @@ class TranslationRequest(BaseModel):
         if not value and info.data.get("output_mono") is False:
             raise ValueError("at least one output must be enabled")
         return value
+
+    @model_validator(mode="after")
+    def validate_provider_options(self) -> TranslationRequest:
+        deepseek_options = (
+            self.deepseek_model,
+            self.deepseek_thinking_mode,
+            self.deepseek_reasoning_effort,
+        )
+        if self.provider == "google":
+            if any(option is not None for option in deepseek_options):
+                raise ValueError("DeepSeek options require the deepseek provider")
+            return self
+        if self.deepseek_model is None:
+            raise ValueError("DeepSeek model is required")
+        if (
+            self.deepseek_reasoning_effort is not None
+            and self.deepseek_thinking_mode != "enabled"
+        ):
+            raise ValueError(
+                "DeepSeek reasoning effort requires explicitly enabled thinking mode"
+            )
+        return self
 
 
 class WorkerState(BaseModel):
@@ -217,13 +272,29 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="PDFMathTranslate Python worker",
-    description="Private Google/BabelDOC bridge. The Rust service is the public API.",
+    description=(
+        "Private Google/DeepSeek BabelDOC bridge. The Rust service is the public API."
+    ),
     version="1.0.0",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def sanitized_request_validation_error(
+    _: Request, error: RequestValidationError
+) -> JSONResponse:
+    # FastAPI's default 422 body includes Pydantic's original `input` value.
+    # This private endpoint never accepts credentials, so omit input/context
+    # entirely before a malformed request can echo an accidentally supplied key.
+    details = [
+        {key: item[key] for key in ("type", "loc", "msg") if key in item}
+        for item in error.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": details})
 
 
 def require_worker_token(
@@ -456,6 +527,18 @@ def _load_terminal_event(job_id: str) -> dict | None:
 
 
 def _build_settings(request: TranslationRequest, output_dir: Path) -> SettingsModel:
+    if request.provider == "deepseek":
+        api_key = os.getenv("PDF2ZH_DEEPSEEK_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("DeepSeek is not configured on this server")
+        translate_engine_settings = DeepSeekSettings(
+            deepseek_model=request.deepseek_model,
+            deepseek_api_key=api_key,
+            deepseek_thinking_mode=request.deepseek_thinking_mode,
+            deepseek_reasoning_effort=request.deepseek_reasoning_effort,
+        )
+    else:
+        translate_engine_settings = GoogleSettings()
     settings = SettingsModel(
         translation=TranslationSettings(
             lang_in=request.source_lang,
@@ -471,7 +554,7 @@ def _build_settings(request: TranslationRequest, output_dir: Path) -> SettingsMo
             no_dual=not request.output_dual,
             watermark_output_mode="no_watermark",
         ),
-        translate_engine_settings=GoogleSettings(),
+        translate_engine_settings=translate_engine_settings,
         term_extraction_engine_settings=None,
         report_interval=0.2,
     )
@@ -561,12 +644,13 @@ async def _run_translation(job: WorkerJob, input_path: Path, output_dir: Path) -
     try:
         settings = _build_settings(job.request, output_dir)
         terminal_event = None
+        provider_name = "DeepSeek" if job.request.provider == "deepseek" else "Google"
         await job.emit(
             {
                 "type": "progress",
                 "progress": 0.0,
                 "stage": "准备文档",
-                "message": "已进入 Google 翻译管线",
+                "message": f"已进入 {provider_name} 翻译管线",
             }
         )
         async with aclosing(do_translate_async_stream(settings, input_path)) as stream:
@@ -623,7 +707,12 @@ async def _run_translation(job: WorkerJob, input_path: Path, output_dir: Path) -
             }
         )
     except Exception as exc:
-        logger.exception("Translation job %s failed", job.job_id)
+        logger.error(
+            "Translation job %s failed (%s): %s",
+            job.job_id,
+            type(exc).__name__,
+            _public_error(exc),
+        )
         if not job.terminal:
             await job.emit(
                 {
@@ -676,6 +765,21 @@ def _public_error(error: object) -> str:
     message = " ".join(str(error or "").split())
     if str(DATA_ROOT) in message:
         message = message.replace(str(DATA_ROOT), "<job>")
+    deepseek_api_key = os.getenv("PDF2ZH_DEEPSEEK_API_KEY", "").strip()
+    if deepseek_api_key:
+        message = message.replace(deepseek_api_key, "<redacted>")
+    message = re.sub(
+        r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}",
+        "Bearer <redacted>",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(api[-_ ]?key|authorization|access[-_ ]?token)\s*[:=]\s*"
+        r"(?:bearer\s+)?[^\s,;]+",
+        r"\1=<redacted>",
+        message,
+    )
+    message = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted>", message)
     return message[:240] or "翻译服务发生未知错误"
 
 
@@ -714,9 +818,13 @@ def _arm_cancel_watchdog(job: WorkerJob) -> None:
 @app.get("/internal/health")
 async def health(_: WorkerAuth) -> dict:
     active = sum(1 for job in _jobs.values() if not job.terminal)
+    providers = ["google"]
+    if os.getenv("PDF2ZH_DEEPSEEK_API_KEY", "").strip():
+        providers.append("deepseek")
     return {
         "status": "ok",
         "provider": "google",
+        "providers": providers,
         "active_jobs": active,
         "accepting_jobs": _accepting_jobs,
         "epoch": WORKER_EPOCH,
