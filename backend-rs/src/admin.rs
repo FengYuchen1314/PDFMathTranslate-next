@@ -300,8 +300,17 @@ impl AdminService {
             .execute(&pool)
             .await?;
 
-        let origin_text =
-            env::var("PDF2ZH_PUBLIC_ORIGIN").unwrap_or_else(|_| format!("http://127.0.0.1:{port}"));
+        let origin_text = match env::var("PDF2ZH_PUBLIC_ORIGIN") {
+            Ok(origin) => origin,
+            Err(_) => match env::var("PDF2ZH_PUBLIC_IP") {
+                Ok(public_ip) => {
+                    let public_port = env::var("PDF2ZH_PUBLIC_PORT")
+                        .unwrap_or_else(|_| port.to_string());
+                    format!("https://{public_ip}:{public_port}")
+                }
+                Err(_) => format!("http://127.0.0.1:{port}"),
+            },
+        };
         let origin = Url::parse(&origin_text)?;
         if !matches!(origin.scheme(), "http" | "https")
             || origin.host().is_none()

@@ -45,6 +45,52 @@ PDF scientific paper translation and bilingual comparison. Based on [BabelDOC](h
 > [docs/architecture-rust-fastapi.md](./docs/architecture-rust-fastapi.md) for the
 > lifecycle, cancellation guarantees, deployment, and verification commands.
 
+## Portable Compose deployment
+
+The supported server deployment needs only [`compose.yml`](./compose.yml).
+GitHub Actions tests the Python, Rust, and React code and publishes the four
+multi-architecture images to GHCR; the target server never compiles source.
+This path supports rootful Docker on Linux, Docker Compose v2.24 or newer, and
+a local POSIX filesystem. For the default VPS (`185.99.135.224`), open inbound
+TCP ports `80` and `7860`, put the Compose file in an empty directory, and run:
+
+```bash
+docker compose up -d --pull always --wait --wait-timeout 600
+```
+
+The first start creates `data/`, `secrets/`, and `tls/` beside the Compose
+file, requests the trusted short-lived IP certificate, and enables automatic
+renewal. Read the one-time administrator claim token locally on the server,
+then open `https://185.99.135.224:7860/admin`:
+
+```bash
+sudo cat ./secrets/web/admin-setup-token
+```
+
+The first successful claim creates the administrator. That administrator adds
+the DeepSeek key in the backend, or defines another HTTPS OpenAI-compatible
+provider and its explicit model allow-list. Anonymous users can use only
+Google. No provider API key belongs in Compose or in a browser.
+
+The distributed Compose file already pins all four images to one tested Git
+commit. To update, replace it with the next release's Compose file and run the
+same command. To select another tested release explicitly, prefix the command
+with `PDF2ZH_IMAGE_TAG=sha-<full-40-character-commit>`. For a different VPS,
+edit the `x-public-ip` and `x-public-port` values in the file once; they then
+remain part of the portable configuration. For migration, stop the service and
+copy the entire directory; the Compose file and its three runtime directories
+are the complete portable unit.
+
+Before packing a migration, wait until the translation queue is idle, stop the
+stack, and archive from its parent directory so ownership, modes, and Certbot
+symlinks are preserved. The archive contains API credentials and TLS private
+keys, so encrypt it and restrict access:
+
+```bash
+docker compose stop
+sudo tar --acls --xattrs -czf ../pdf2zh-portable.tgz .
+```
+
 - 📊 Preserve formulas, charts, table of contents, and annotations _([preview](#preview))_.
 - 🌐 Support [multiple languages](https://pdf2zh-next.com/supported_languages.html), and diverse [translation services](https://pdf2zh-next.com/advanced/Documentation-of-Translation-Services.html).
 - 🤖 Provides [commandline tool](https://pdf2zh-next.com/getting-started/USAGE_commandline.html), [interactive user interface](https://pdf2zh-next.com/getting-started/USAGE_webui.html), and [Docker](https://pdf2zh-next.com/getting-started/INSTALLATION_docker.html)

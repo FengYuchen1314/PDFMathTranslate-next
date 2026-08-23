@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1.7
+
+FROM certbot/certbot:v5.7.0@sha256:34ee91d2f43008eb78a007d22f23ed4b2eaa9a454cb27ca2c042b49527a695b4
+
+COPY deploy/portable-init.sh /usr/local/bin/pdf2zh-portable-init
+COPY deploy/portable-certbot-loop.sh /usr/local/bin/pdf2zh-certbot-loop
+COPY deploy/portable-certbot-health.sh /usr/local/bin/pdf2zh-certbot-health
+
+RUN chmod 0755 \
+    /usr/local/bin/pdf2zh-portable-init \
+    /usr/local/bin/pdf2zh-certbot-loop \
+    /usr/local/bin/pdf2zh-certbot-health
+
+ENTRYPOINT []
+CMD ["/usr/local/bin/pdf2zh-portable-init"]

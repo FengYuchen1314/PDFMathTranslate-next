@@ -174,3 +174,8 @@ uv.lock
 *.pdf
 *.docx
 CLAUDE.md
+
+# Portable Docker Compose runtime state (kept beside compose.yml on the VPS).
+/data/
+/secrets/
+/tls/

@@ -16,3 +16,6 @@ frontend/dist
 tests
 docs
 *.log
+/data/
+/secrets/
+/tls/

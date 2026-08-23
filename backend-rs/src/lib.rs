@@ -98,7 +98,7 @@ impl AppConfig {
             .trim_end_matches('/')
             .to_owned();
         let worker_token =
-            env::var("PDF2ZH_WORKER_TOKEN").map_err(|_| "PDF2ZH_WORKER_TOKEN must be set")?;
+            secret_from_env_or_file("PDF2ZH_WORKER_TOKEN", "PDF2ZH_WORKER_TOKEN_FILE")?;
         if worker_token.trim().is_empty() {
             return Err("PDF2ZH_WORKER_TOKEN cannot be blank".into());
         }
@@ -144,6 +144,16 @@ impl AppConfig {
             id_tombstone_retention,
         })
     }
+}
+
+fn secret_from_env_or_file(value_name: &str, file_name: &str) -> Result<String, BoxError> {
+    if let Some(path) = env::var_os(file_name) {
+        let path = PathBuf::from(path);
+        let value = std::fs::read_to_string(&path)
+            .map_err(|error| format!("could not read {file_name} {}: {error}", path.display()))?;
+        return Ok(value.trim_end_matches(&['\r', '\n'][..]).to_owned());
+    }
+    env::var(value_name).map_err(|_| format!("{value_name} or {file_name} must be set").into())
 }
 
 fn env_parse<T>(name: &str, default: T) -> Result<T, BoxError>

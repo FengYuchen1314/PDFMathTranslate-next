@@ -1,7 +1,8 @@
 # Rust + FastAPI Web Architecture
 
 The public web application no longer runs on Gradio. It is split into two
-containers and one browser application:
+application containers, a TLS gateway, an operations image, and one browser
+application:
 
 ```text
 Browser (React + Vite)
@@ -135,7 +136,51 @@ Corrupt journals are quarantined and replaced with a durable failed tombstone.
 All drain and recycle waits are bounded; failure to prove a clean new worker
 epoch exits the coordinator non-zero so Docker can replace its cgroup.
 
-## VPS deployment
+## Portable Compose deployment
+
+New installations use the repository-root `compose.yml`. The server downloads
+prebuilt GHCR images and does not need the source tree, Dockerfiles, or helper
+scripts. This deployment contract requires rootful Docker on Linux, Compose
+v2.24 or newer, and a local POSIX filesystem; rootless Docker, Windows bind
+mount permissions, and remote Docker contexts are not covered. On
+`185.99.135.224`, place that one file in an empty directory and run:
+
+```bash
+docker compose up -d --pull always --wait --wait-timeout 600
+```
+
+The one-shot `init` service creates and validates all credentials, storage, and
+the temporary bootstrap certificate. The gateway then serves the ACME webroot;
+the long-running certbot service requests the trusted short-lived IP
+certificate, copies a validated key/certificate pair into `tls/active`, and
+Nginx reloads it. A bounded exponential retry avoids certificate-authority
+rate-limit storms. `docker compose --wait` returns successfully only after the
+trusted certificate is installed.
+
+All durable material is relative to the Compose file:
+
+- `data/jobs`: uploaded and translated job artifacts.
+- `data/state`: Rust SQLite state, sessions, and encrypted provider records.
+- `data/certbot`: renewal health state.
+- `secrets/web`: provider master key, first-admin token, and web worker token.
+- `secrets/worker`: the translator-only copy of the worker token.
+- `tls`: ACME, certificate lineage, and active gateway certificate.
+
+Copy the entire directory while the stack is stopped to migrate it. Never copy
+`data/state` without `secrets/web`, because encrypted provider credentials are
+deliberately unrecoverable without their original master key. The initializer
+fails closed instead of silently replacing a lost key. For a different IPv4
+address or public port, edit the top-level `x-public-ip` and `x-public-port`
+values in the Compose file so the settings survive every later invocation. A
+complete release can be selected with
+`PDF2ZH_IMAGE_TAG=sha-<full-40-character-commit>`; the distributed file already
+defaults to one immutable, tested commit tag.
+
+## Legacy VPS release engineering (historical)
+
+The remainder of this document records the earlier source-on-VPS release and
+rollback process. It remains useful for forensic recovery of the existing host,
+but it is not the installation path for new users.
 
 Everything in this section is run on `185.99.135.224`. Do not format source,
 generate a lock file, run a test, compile, or build an image on a developer

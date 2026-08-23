@@ -19,7 +19,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pdf2zh.worker_supervisor")
 
-WORKER_TOKEN = os.getenv("PDF2ZH_WORKER_TOKEN", "")
+
+def _load_worker_token() -> str:
+    token_file = os.environ.get("PDF2ZH_WORKER_TOKEN_FILE", "")
+    if token_file:
+        return Path(token_file).read_text(encoding="utf-8").rstrip("\r\n")
+    return os.environ.get("PDF2ZH_WORKER_TOKEN", "")
+
+
+WORKER_TOKEN = _load_worker_token()
 PUBLIC_WORKER_MODE = os.getenv("PDF2ZH_PUBLIC_WORKER_MODE", "") == "1"
 CONTAINER_BOOT_ID = str(uuid4())
 WORKER_RECYCLE_EXIT_CODE = 75
@@ -208,6 +216,7 @@ def _spawn_child() -> subprocess.Popen:
     # permissive ptrace policy they could otherwise read it through /proc. A
     # one-use inherited pipe is consumed and closed during worker_api import.
     child_environment.pop("PDF2ZH_WORKER_TOKEN", None)
+    child_environment.pop("PDF2ZH_WORKER_TOKEN_FILE", None)
     token_read_fd, token_write_fd = os.pipe()
     try:
         encoded_token = WORKER_TOKEN.encode()

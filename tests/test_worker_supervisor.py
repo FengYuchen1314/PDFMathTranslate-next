@@ -6,6 +6,22 @@ from types import SimpleNamespace
 from pdf2zh_next import worker_supervisor
 
 
+def test_load_worker_token_prefers_file(tmp_path, monkeypatch):
+    token_file = tmp_path / "worker-token"
+    token_file.write_text("file-secret\n", encoding="utf-8")
+    monkeypatch.setenv("PDF2ZH_WORKER_TOKEN", "environment-secret")
+    monkeypatch.setenv("PDF2ZH_WORKER_TOKEN_FILE", str(token_file))
+
+    assert worker_supervisor._load_worker_token() == "file-secret"
+
+
+def test_load_worker_token_supports_legacy_environment(monkeypatch):
+    monkeypatch.delenv("PDF2ZH_WORKER_TOKEN_FILE", raising=False)
+    monkeypatch.setenv("PDF2ZH_WORKER_TOKEN", "environment-secret")
+
+    assert worker_supervisor._load_worker_token() == "environment-secret"
+
+
 def test_supervisor_requires_private_worker_token(monkeypatch):
     monkeypatch.setattr(worker_supervisor, "WORKER_TOKEN", "")
 
