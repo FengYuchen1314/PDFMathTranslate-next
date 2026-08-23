@@ -86,7 +86,7 @@ class OpenAISettings(BaseModel):
         default=None, description="Base URL for OpenAI API"
     )
     openai_api_key: str | None = Field(
-        default=None, description="API key for OpenAI service"
+        default=None, description="API key for OpenAI service", repr=False
     )
     openai_timeout: str | None = Field(
         default=None, description="Timeout (seconds) for OpenAI service"
@@ -190,7 +190,7 @@ class DeepSeekSettings(BaseModel):
         default="deepseek-v4-flash", description="DeepSeek model to use"
     )
     deepseek_api_key: str | None = Field(
-        default=None, description="API key for DeepSeek service"
+        default=None, description="API key for DeepSeek service", repr=False
     )
     deepseek_enable_json_mode: bool | None = Field(
         default=None, description="Enable JSON mode for DeepSeek service"
@@ -721,7 +721,9 @@ class OpenAICompatibleSettings(BaseModel):
         default=None, description="Base URL for OpenAI Compatible service"
     )
     openai_compatible_api_key: str | None = Field(
-        default=None, description="API key for OpenAI Compatible service"
+        default=None,
+        description="API key for OpenAI Compatible service",
+        repr=False,
     )
     openai_compatible_timeout: str | None = Field(
         default=None, description="Timeout (seconds) for OpenAI Compatible service"

@@ -37,9 +37,12 @@ async fn main() -> anyhowless::Result<()> {
     });
 
     let server_stop = stop_accepting.clone();
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async move { server_stop.cancelled().await })
-        .await;
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { server_stop.cancelled().await })
+    .await;
     if stop_accepting.is_cancelled() {
         cleanup_complete.cancelled().await;
     }

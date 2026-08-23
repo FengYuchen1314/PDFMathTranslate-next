@@ -1,0 +1,15 @@
+name: pdf2zh-acceptance
+
+services:
+  web:
+    ports:
+      - "127.0.0.1:${PDF2ZH_ACCEPTANCE_PORT:-17860}:7860"
+    environment:
+      PDF2ZH_PUBLIC_ORIGIN: "http://127.0.0.1:${PDF2ZH_ACCEPTANCE_PORT:-17860}"
+      PDF2ZH_SECURE_COOKIES: "false"
+
+secrets:
+  pdf2zh_master_key:
+    file: ${PDF2ZH_ACCEPTANCE_MASTER_KEY_FILE_HOST:?set a disposable acceptance master-key file}
+  pdf2zh_setup_token:
+    file: ${PDF2ZH_ACCEPTANCE_SETUP_TOKEN_FILE_HOST:?set a disposable acceptance setup-token file}

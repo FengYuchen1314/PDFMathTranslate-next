@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
-import re
 import secrets
 import shutil
+import socket
 import threading
 from contextlib import aclosing
 from contextlib import asynccontextmanager
@@ -16,6 +17,9 @@ from pathlib import Path
 from typing import Annotated
 from typing import Literal
 from typing import TypeAlias
+from urllib.parse import SplitResult
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 from uuid import UUID
 from uuid import uuid4
 
@@ -31,6 +35,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import SecretStr
 from pydantic import field_validator
 from pydantic import model_validator
 
@@ -39,13 +44,58 @@ from pdf2zh_next.config.model import SettingsModel
 from pdf2zh_next.config.model import TranslationSettings
 from pdf2zh_next.config.translate_engine_model import DeepSeekSettings
 from pdf2zh_next.config.translate_engine_model import GoogleSettings
+from pdf2zh_next.config.translate_engine_model import OpenAICompatibleSettings
 from pdf2zh_next.high_level import UnrecoverableCleanupError
 from pdf2zh_next.high_level import do_translate_async_stream
 
 logger = logging.getLogger(__name__)
 
+# The OpenAI SDK and the translation subprocess can include request options,
+# upstream response bodies, document text, or tracebacks in log records. The
+# public worker exposes only its own sanitized error categories, so discard
+# those private diagnostics before they can reach the container log.
+for _private_logger_name in (
+    "openai",
+    "httpx",
+    "httpcore",
+    "h11",
+    "pdf2zh_next.high_level",
+):
+    _private_logger = logging.getLogger(_private_logger_name)
+    _private_logger.setLevel(logging.CRITICAL)
+    _private_logger.propagate = False
+
+
+def _consume_worker_token() -> str:
+    raw_fd = os.environ.pop("PDF2ZH_WORKER_TOKEN_FD", "")
+    legacy_token = os.environ.pop("PDF2ZH_WORKER_TOKEN", "")
+    if raw_fd:
+        try:
+            token_fd = int(raw_fd)
+        except ValueError as exc:
+            raise RuntimeError("PDF2ZH_WORKER_TOKEN_FD is invalid") from exc
+        try:
+            with os.fdopen(token_fd, "rb", closefd=True) as token_pipe:
+                encoded_token = token_pipe.read(4097)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("PDF2ZH worker token pipe is unreadable") from exc
+        if len(encoded_token) > 4096:
+            raise RuntimeError("PDF2ZH worker token is too long")
+        try:
+            return encoded_token.decode()
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("PDF2ZH worker token is not UTF-8") from exc
+    # Direct development/test launches retain the legacy environment input.
+    # Pop it immediately so a later spawn translation process cannot inherit
+    # the coordinator credential.
+    return legacy_token
+
+
 DATA_ROOT = Path(os.getenv("PDF2ZH_DATA_ROOT", "/data/jobs")).resolve()
-WORKER_TOKEN = os.getenv("PDF2ZH_WORKER_TOKEN", "")
+WORKER_TOKEN = _consume_worker_token()
+PUBLIC_WORKER_MODE = os.getenv("PDF2ZH_PUBLIC_WORKER_MODE", "") == "1"
+_CONFIGURED_CONTAINER_BOOT_ID = os.environ.pop("PDF2ZH_CONTAINER_BOOT_ID", "")
+CONTAINER_BOOT_ID = _CONFIGURED_CONTAINER_BOOT_ID or f"unmanaged-{uuid4()}"
 JOB_RETENTION_SECONDS = max(
     60, int(os.getenv("PDF2ZH_WORKER_JOB_RETENTION_SECONDS", "21600"))
 )
@@ -54,6 +104,9 @@ MAX_JOURNAL_EVENTS = max(
 )
 CANCEL_HARD_TIMEOUT_SECONDS = max(
     5, int(os.getenv("PDF2ZH_CANCEL_HARD_TIMEOUT_SECONDS", "75"))
+)
+DNS_RESOLUTION_TIMEOUT_SECONDS = max(
+    1.0, float(os.getenv("PDF2ZH_DNS_RESOLUTION_TIMEOUT_SECONDS", "5"))
 )
 SUPPORTED_LANGUAGES = {
     "auto",
@@ -74,13 +127,130 @@ TERMINAL_JOURNAL_FILENAME = ".worker-terminal.json"
 TERMINAL_RECOVERY_FILENAME = ".worker-terminal.recovery.json"
 MAX_TERMINAL_JOURNAL_BYTES = 64 * 1024
 WORKER_EPOCH = str(uuid4())
+WORKER_RECYCLE_EXIT_CODE = 75
+# Give a waiting HTTP event stream a best-effort opportunity to flush the
+# terminal line. Correctness never depends on this delay: the fsync'd journal
+# is the cross-epoch source of truth.
+WORKER_RECYCLE_DELAY_SECONDS = 0.05
+DEEPSEEK_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
+LOCAL_HOSTNAME_SUFFIXES = (".internal", ".local", ".localhost")
+PUBLIC_FAILURE_MESSAGES = {
+    "翻译渠道认证失败，请联系管理员检查密钥",
+    "翻译渠道请求过于频繁或额度不足，请稍后重试",
+    "翻译渠道响应超时，请稍后重试",
+    "无法连接翻译渠道，请稍后重试",
+    "翻译渠道拒绝了请求，请联系管理员检查模型配置",
+    "翻译服务暂时无法完成任务，请稍后重试",
+}
+
+
+def _address_is_public(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return address.is_global and not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_unspecified
+        or address.is_reserved
+    )
+
+
+def _resolved_addresses_are_public(hostname: str, port: int) -> bool:
+    try:
+        answers = socket.getaddrinfo(
+            hostname,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+    except (OSError, UnicodeError):
+        # Provider endpoints are administrator supplied. Resolver failure must
+        # fail closed rather than defer an unchecked hostname to HTTPX.
+        return False
+    addresses = {answer[4][0].split("%", 1)[0] for answer in answers}
+    return bool(addresses) and all(_address_is_public(address) for address in addresses)
+
+
+def _normalized_openai_base_url(value: str) -> str:
+    raw = value.strip()
+    if not raw or any(ord(character) < 0x20 for character in raw) or "\\" in raw:
+        raise ValueError("OpenAI-compatible base URL is invalid")
+    try:
+        parsed = urlsplit(raw)
+        _validated_port = parsed.port  # force malformed/out-of-range validation
+    except ValueError as exc:
+        raise ValueError("OpenAI-compatible base URL is invalid") from exc
+    if parsed.scheme.lower() != "https":
+        raise ValueError("OpenAI-compatible base URL must use HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("OpenAI-compatible base URL cannot contain user info")
+    if parsed.query or parsed.fragment:
+        raise ValueError("OpenAI-compatible base URL cannot contain query or fragment")
+    if not parsed.hostname:
+        raise ValueError("OpenAI-compatible base URL requires a host")
+    if "%" in parsed.hostname:
+        raise ValueError("OpenAI-compatible base URL host cannot be percent-encoded")
+    try:
+        hostname = parsed.hostname.encode("idna").decode("ascii").rstrip(".").lower()
+    except UnicodeError as exc:
+        raise ValueError("OpenAI-compatible base URL host is invalid") from exc
+    if not hostname:
+        raise ValueError("OpenAI-compatible base URL requires a host")
+    if hostname == "localhost" or hostname.endswith(LOCAL_HOSTNAME_SUFFIXES):
+        raise ValueError("OpenAI-compatible base URL cannot target a local host")
+    try:
+        literal_address = ipaddress.ip_address(hostname.split("%", 1)[0])
+    except ValueError:
+        literal_address = None
+    if literal_address is not None:
+        if not _address_is_public(str(literal_address)):
+            raise ValueError(
+                "OpenAI-compatible base URL cannot target a private address"
+            )
+    normalized_host = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = (
+        normalized_host if parsed.port is None else f"{normalized_host}:{parsed.port}"
+    )
+    path = parsed.path.rstrip("/")
+    normalized = SplitResult("https", netloc, path, "", "")
+    return urlunsplit(normalized)
+
+
+async def _validate_openai_endpoint_for_job(request: TranslationRequest) -> None:
+    if request.provider != "openai_compatible" or not request.openai_base_url:
+        return
+    parsed = urlsplit(request.openai_base_url)
+    hostname = parsed.hostname or ""
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        port = parsed.port or 443
+        try:
+            is_public = await asyncio.wait_for(
+                asyncio.to_thread(_resolved_addresses_are_public, hostname, port),
+                timeout=DNS_RESOLUTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            # Cancelling asyncio.to_thread cannot stop a libc resolver call.
+            # Treat the worker epoch as contaminated so the supervisor replaces
+            # its process/cgroup instead of accumulating stuck resolver threads.
+            raise UnrecoverableCleanupError(
+                "DNS resolution exceeded its cleanup-safe deadline"
+            ) from exc
+        if not is_public:
+            raise ValueError(
+                "OpenAI-compatible base URL must resolve exclusively to public addresses"
+            ) from None
 
 
 class TranslationRequest(BaseModel):
-    # This is an internal endpoint, and the Rust coordinator sends an exact
-    # schema. Silently dropping unknown fields also prevents an accidentally
-    # submitted API key from being echoed in FastAPI's 422 validation details.
-    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
+    # This is an authenticated internal endpoint. Unknown fields are rejected,
+    # while the exception handler below removes Pydantic's original input from
+    # every 422 response so credentials can never be echoed.
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     input_path: str
     output_dir: str
@@ -89,27 +259,13 @@ class TranslationRequest(BaseModel):
     pages: str | None = Field(default=None, max_length=256)
     output_mono: bool = True
     output_dual: bool = True
-    provider: Literal["google", "deepseek"] = "google"
-    deepseek_model: Literal["deepseek-v4-flash", "deepseek-v4-pro"] | None = None
-    deepseek_thinking_mode: Literal["enabled", "disabled"] | None = None
-    deepseek_reasoning_effort: Literal["low", "high", "max"] | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def discard_client_secret_fields(cls, value: object) -> object:
-        if not isinstance(value, dict):
-            return value
-        return {
-            key: item
-            for key, item in value.items()
-            if not (
-                isinstance(key, str)
-                and (
-                    "apikey" in key.lower().replace("_", "").replace("-", "")
-                    or "baseurl" in key.lower().replace("_", "").replace("-", "")
-                )
-            )
-        }
+    provider: Literal["google", "deepseek", "openai_compatible"] = "google"
+    model: str | None = Field(default=None, max_length=256)
+    thinking_mode: Literal["enabled", "disabled"] | None = None
+    reasoning_effort: Literal["low", "high", "max"] | None = None
+    provider_name: str | None = Field(default=None, max_length=120)
+    openai_base_url: str | None = Field(default=None, max_length=2048)
+    openai_api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
 
     @field_validator("source_lang", "target_lang")
     @classmethod
@@ -139,6 +295,35 @@ class TranslationRequest(BaseModel):
                 raise ValueError("page range must be ascending")
         return value
 
+    @field_validator("model")
+    @classmethod
+    def normalize_optional_model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value cannot be blank")
+        if any(ord(character) < 0x20 for character in normalized):
+            raise ValueError("model cannot contain control characters")
+        return normalized
+
+    @field_validator("provider_name")
+    @classmethod
+    def normalize_optional_provider_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("value cannot be blank")
+        return normalized
+
+    @field_validator("openai_base_url")
+    @classmethod
+    def normalize_openai_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalized_openai_base_url(value)
+
     @field_validator("output_dual")
     @classmethod
     def validate_output_choice(cls, value: bool, info):
@@ -148,24 +333,44 @@ class TranslationRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_provider_options(self) -> TranslationRequest:
-        deepseek_options = (
-            self.deepseek_model,
-            self.deepseek_thinking_mode,
-            self.deepseek_reasoning_effort,
+        if self.openai_api_key is not None:
+            api_key = self.openai_api_key.get_secret_value().strip()
+            if not api_key:
+                raise ValueError("OpenAI API key cannot be blank")
+            if len(api_key) > 8192:
+                raise ValueError("OpenAI API key is too long")
+            self.openai_api_key = SecretStr(api_key)
+        engine_options = (
+            self.model,
+            self.thinking_mode,
+            self.reasoning_effort,
+            self.provider_name,
+            self.openai_base_url,
+            self.openai_api_key,
         )
         if self.provider == "google":
-            if any(option is not None for option in deepseek_options):
-                raise ValueError("DeepSeek options require the deepseek provider")
+            if any(option is not None for option in engine_options):
+                raise ValueError("Google does not accept configured-provider options")
             return self
-        if self.deepseek_model is None:
-            raise ValueError("DeepSeek model is required")
-        if (
-            self.deepseek_reasoning_effort is not None
-            and self.deepseek_thinking_mode != "enabled"
-        ):
-            raise ValueError(
-                "DeepSeek reasoning effort requires explicitly enabled thinking mode"
-            )
+        if self.openai_api_key is None:
+            raise ValueError("Configured providers require an API key")
+        if self.provider == "deepseek":
+            if self.openai_base_url is not None:
+                raise ValueError("DeepSeek uses its fixed official base URL")
+            if self.model is not None and self.model not in DEEPSEEK_MODELS:
+                raise ValueError("Unsupported DeepSeek model")
+            if self.reasoning_effort is not None and self.thinking_mode != "enabled":
+                raise ValueError(
+                    "DeepSeek reasoning effort requires explicitly enabled "
+                    "thinking mode"
+                )
+            return self
+        if self.model is None:
+            raise ValueError("OpenAI-compatible providers require a model")
+        if self.openai_base_url is None:
+            raise ValueError("OpenAI-compatible providers require a base URL")
+        if self.thinking_mode is not None:
+            raise ValueError("Thinking mode is only supported by the DeepSeek provider")
         return self
 
 
@@ -186,7 +391,7 @@ class TerminalJournalError(RuntimeError):
 @dataclass
 class WorkerJob:
     job_id: str
-    request: TranslationRequest
+    request: TranslationRequest = field(repr=False)
     events: list[dict] = field(default_factory=list)
     event_offset: int = 0
     terminal_journal_path: Path | None = None
@@ -202,16 +407,44 @@ class WorkerJob:
 
     async def emit(self, event: dict) -> None:
         event = {"job_id": self.job_id, **event}
+        if event.get("type") in TERMINAL_EVENTS:
+            allowed_fields = {
+                "job_id",
+                "type",
+                "progress",
+                "stage",
+                "message",
+                "files",
+            }
+            event = {
+                key: value for key, value in event.items() if key in allowed_fields
+            }
+            event_type = event.get("type")
+            if event_type == "finished":
+                event["stage"] = "翻译完成"
+                event["message"] = "文件已整理，可以下载"
+            elif event_type == "cancelled":
+                event["stage"] = "已取消"
+                event["message"] = "翻译进程与临时资源已回收"
+            else:
+                event["stage"] = "翻译失败"
+                event["message"] = _public_error(event.get("message"), self.request)
         async with self.condition:
             event_type = event.get("type")
             if self.terminal:
                 return
             if event_type in TERMINAL_EVENTS:
+                if PUBLIC_WORKER_MODE and self.terminal_journal_path is None:
+                    _fail_stop_worker(
+                        self.job_id,
+                        RuntimeError("public terminal job has no journal path"),
+                        self.request,
+                    )
                 if self.terminal_journal_path is not None:
                     try:
                         _persist_terminal_event(self.terminal_journal_path, event)
                     except (OSError, TypeError, ValueError) as exc:
-                        _fail_stop_worker(self.job_id, exc)
+                        _fail_stop_worker(self.job_id, exc, self.request)
                         raise UnrecoverableCleanupError(
                             "Could not commit the worker terminal journal"
                         ) from exc
@@ -223,7 +456,16 @@ class WorkerJob:
                 self.events.append(event)
                 self.status = str(event_type)
                 self.terminal = True
+                # Terminal jobs are retained for status polling, but never
+                # retain the per-request provider credential. Doing this at
+                # publication also covers tasks cancelled before their
+                # coroutine body (and its finally block) is ever polled.
+                self.request.openai_api_key = None
                 self.cleanup_complete.set()
+                # Admission closes only after the sanitized terminal record is
+                # durably committed, but before another handler can observe
+                # this job as terminal and submit work to the same epoch.
+                _retire_container_after_terminal(self.job_id)
             else:
                 self.events.append(event)
                 overflow = len(self.events) - MAX_JOURNAL_EVENTS
@@ -237,6 +479,77 @@ _jobs: dict[str, WorkerJob] = {}
 _cancelled_before_start: dict[str, object] = {}
 _jobs_lock = asyncio.Lock()
 _accepting_jobs = True
+_retire_requested = False
+_recycle_scheduled = threading.Event()
+
+
+def _worker_process_has_app_identity() -> bool:
+    get_effective_uid = getattr(os, "geteuid", None)
+    get_effective_gid = getattr(os, "getegid", None)
+    return (
+        get_effective_uid is not None
+        and get_effective_gid is not None
+        and get_effective_uid() == 10001
+        and get_effective_gid() == 10001
+    )
+
+
+def _validate_runtime_configuration() -> None:
+    raw_max_active_jobs = os.getenv("PDF2ZH_MAX_ACTIVE_JOBS", "1")
+    try:
+        max_active_jobs = int(raw_max_active_jobs)
+    except ValueError as exc:
+        raise RuntimeError("PDF2ZH_MAX_ACTIVE_JOBS must be exactly 1") from exc
+    if max_active_jobs != 1:
+        raise RuntimeError("PDF2ZH_MAX_ACTIVE_JOBS must be exactly 1")
+    if PUBLIC_WORKER_MODE:
+        configured_boot_id = _CONFIGURED_CONTAINER_BOOT_ID
+        try:
+            parsed_boot_id = UUID(configured_boot_id)
+        except ValueError as exc:
+            raise RuntimeError(
+                "PDF2ZH_CONTAINER_BOOT_ID must be supplied by the worker supervisor"
+            ) from exc
+        if str(parsed_boot_id) != configured_boot_id:
+            raise RuntimeError(
+                "PDF2ZH_CONTAINER_BOOT_ID must be a canonical supervisor UUID"
+            )
+        if not _worker_process_has_app_identity():
+            raise RuntimeError(
+                "public worker API must run as unprivileged uid/gid 10001"
+            )
+
+
+def _retire_container_after_terminal(job_id: str) -> None:
+    """Close admission and recycle this public worker after one terminal job."""
+    global _accepting_jobs
+    global _retire_requested
+    if not PUBLIC_WORKER_MODE:
+        return
+    _accepting_jobs = False
+    _retire_requested = True
+    if _recycle_scheduled.is_set():
+        return
+    _recycle_scheduled.set()
+    logger.info(
+        "Job %s committed its terminal journal; retiring worker epoch %s",
+        job_id,
+        WORKER_EPOCH,
+    )
+    try:
+        exit_timer = threading.Timer(
+            WORKER_RECYCLE_DELAY_SECONDS,
+            os._exit,
+            args=(WORKER_RECYCLE_EXIT_CODE,),
+        )
+        exit_timer.daemon = True
+        exit_timer.start()
+    except Exception as exc:
+        logger.critical(
+            "Could not arm terminal worker recycle (%s); exiting immediately",
+            type(exc).__name__,
+        )
+        os._exit(WORKER_RECYCLE_EXIT_CODE)
 
 
 @asynccontextmanager
@@ -244,6 +557,7 @@ async def lifespan(_: FastAPI):
     global _accepting_jobs
     if not WORKER_TOKEN:
         raise RuntimeError("PDF2ZH_WORKER_TOKEN is required")
+    _validate_runtime_configuration()
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     yield
     async with _jobs_lock:
@@ -273,7 +587,8 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="PDFMathTranslate Python worker",
     description=(
-        "Private Google/DeepSeek BabelDOC bridge. The Rust service is the public API."
+        "Private Google/DeepSeek/OpenAI-compatible BabelDOC bridge. "
+        "The Rust service is the public API."
     ),
     version="1.0.0",
     docs_url=None,
@@ -283,13 +598,34 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def reject_job_body_after_terminal(request: Request, call_next):
+    # Route dependencies run after FastAPI has parsed TranslationRequest. Once
+    # this epoch has committed a terminal, reject an exact start-job route at
+    # the ASGI boundary so a provider credential is never deserialized into the
+    # retiring process during the short journal-recovery handoff.
+    path_parts = request.url.path.strip("/").split("/")
+    if (
+        PUBLIC_WORKER_MODE
+        and _retire_requested
+        and request.method == "POST"
+        and len(path_parts) == 3
+        and path_parts[:2] == ["internal", "jobs"]
+    ):
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "worker generation is retiring"},
+        )
+    return await call_next(request)
+
+
 @app.exception_handler(RequestValidationError)
 async def sanitized_request_validation_error(
     _: Request, error: RequestValidationError
 ) -> JSONResponse:
     # FastAPI's default 422 body includes Pydantic's original `input` value.
-    # This private endpoint never accepts credentials, so omit input/context
-    # entirely before a malformed request can echo an accidentally supplied key.
+    # Configured-provider requests contain credentials, so omit input/context
+    # entirely before malformed input can echo a supplied key.
     details = [
         {key: item[key] for key in ("type", "loc", "msg") if key in item}
         for item in error.errors()
@@ -528,14 +864,32 @@ def _load_terminal_event(job_id: str) -> dict | None:
 
 def _build_settings(request: TranslationRequest, output_dir: Path) -> SettingsModel:
     if request.provider == "deepseek":
-        api_key = os.getenv("PDF2ZH_DEEPSEEK_API_KEY", "").strip()
-        if not api_key:
-            raise ValueError("DeepSeek is not configured on this server")
+        # DeepSeek's current API accepts high/max. Its compatibility mapping
+        # treats low as high, so normalize before constructing OpenAI options.
+        deepseek_reasoning_effort = (
+            "high" if request.reasoning_effort == "low" else request.reasoning_effort
+        )
         translate_engine_settings = DeepSeekSettings(
-            deepseek_model=request.deepseek_model,
-            deepseek_api_key=api_key,
-            deepseek_thinking_mode=request.deepseek_thinking_mode,
-            deepseek_reasoning_effort=request.deepseek_reasoning_effort,
+            deepseek_model=request.model or "deepseek-v4-flash",
+            deepseek_api_key=_request_api_key(request),
+            deepseek_thinking_mode=request.thinking_mode,
+            deepseek_reasoning_effort=deepseek_reasoning_effort,
+        )
+    elif request.provider == "openai_compatible":
+        # Re-resolve the hostname at job start. This narrows DNS-rebinding
+        # windows and makes the worker the final application-level authority on
+        # outbound URLs. DNS can still change between this check and HTTPX's
+        # connection; an egress firewall/proxy is required for an atomic network
+        # boundary.
+        base_url = _normalized_openai_base_url(request.openai_base_url or "")
+        translate_engine_settings = OpenAICompatibleSettings(
+            openai_compatible_model=request.model or "",
+            openai_compatible_base_url=base_url,
+            openai_compatible_api_key=_request_api_key(request),
+            openai_compatible_reasoning_effort=request.reasoning_effort,
+            openai_compatible_send_reasoning_effort=(
+                request.reasoning_effort is not None
+            ),
         )
     else:
         translate_engine_settings = GoogleSettings()
@@ -544,6 +898,9 @@ def _build_settings(request: TranslationRequest, output_dir: Path) -> SettingsMo
             lang_in=request.source_lang,
             lang_out=request.target_lang,
             output=str(output_dir),
+            # Public jobs can contain confidential document text. Do not put
+            # source/translated fragments into the process-wide SQLite cache.
+            ignore_cache=True,
             no_auto_extract_glossary=True,
             qps=4,
             pool_max_workers=4,
@@ -560,6 +917,12 @@ def _build_settings(request: TranslationRequest, output_dir: Path) -> SettingsMo
     )
     settings.validate_settings()
     return settings
+
+
+def _request_api_key(request: TranslationRequest) -> str:
+    if request.openai_api_key is None:
+        raise ValueError("Configured provider API key is unavailable")
+    return request.openai_api_key.get_secret_value()
 
 
 def _copy_result(source: object, destination: Path) -> bool:
@@ -642,9 +1005,21 @@ def _progress_event(event: dict) -> dict:
 
 async def _run_translation(job: WorkerJob, input_path: Path, output_dir: Path) -> None:
     try:
+        # DNS lookup runs off the event loop and has a hard bound, so a slow
+        # administrator-configured resolver cannot stall cancellation or the
+        # worker health endpoint. Only the hostname enters that helper thread;
+        # the provider credential remains on this task.
+        await _validate_openai_endpoint_for_job(job.request)
         settings = _build_settings(job.request, output_dir)
         terminal_event = None
-        provider_name = "DeepSeek" if job.request.provider == "deepseek" else "Google"
+        provider_name = {
+            "google": "Google",
+            "deepseek": "DeepSeek",
+            "openai_compatible": "OpenAI 兼容",
+        }[job.request.provider]
+        provider_name = _safe_public_label(
+            job.request.provider_name or provider_name,
+        )
         await job.emit(
             {
                 "type": "progress",
@@ -675,15 +1050,12 @@ async def _run_translation(job: WorkerJob, input_path: Path, output_dir: Path) -
                         cleanup_error = UnrecoverableCleanupError(
                             str(event.get("error") or "cleanup was not confirmed")
                         )
-                        _fail_stop_worker(
-                            job.job_id,
-                            cleanup_error,
-                        )
+                        _fail_stop_worker(job.job_id, cleanup_error, job.request)
                         raise cleanup_error
                     terminal_event = {
                         "type": "failed",
                         "stage": "翻译失败",
-                        "message": _public_error(event.get("error")),
+                        "message": event.get("error"),
                     }
                     break
         if terminal_event is None:
@@ -696,7 +1068,7 @@ async def _run_translation(job: WorkerJob, input_path: Path, output_dir: Path) -
         # release its permit only after every Python generator cleanup is done.
         await job.emit(terminal_event)
     except UnrecoverableCleanupError as exc:
-        _fail_stop_worker(job.job_id, exc)
+        _fail_stop_worker(job.job_id, exc, job.request)
     except asyncio.CancelledError:
         logger.info("Translation job %s was cancelled after cleanup", job.job_id)
         await job.emit(
@@ -708,20 +1080,22 @@ async def _run_translation(job: WorkerJob, input_path: Path, output_dir: Path) -
         )
     except Exception as exc:
         logger.error(
-            "Translation job %s failed (%s): %s",
+            "Translation job %s failed (%s)",
             job.job_id,
             type(exc).__name__,
-            _public_error(exc),
         )
         if not job.terminal:
             await job.emit(
                 {
                     "type": "failed",
                     "stage": "翻译失败",
-                    "message": _public_error(exc),
+                    "message": exc,
                 }
             )
     finally:
+        # Terminal jobs remain queryable for several hours, but their provider
+        # credential must not remain reachable through that retained object.
+        job.request.openai_api_key = None
         asyncio.create_task(_expire_job(job.job_id, job))
 
 
@@ -761,33 +1135,90 @@ async def _expire_cancel_tombstone(job_id: str, expected_marker: object) -> None
             _cancelled_before_start.pop(job_id, None)
 
 
-def _public_error(error: object) -> str:
+def _public_error(
+    error: object,
+    request: TranslationRequest | None = None,
+) -> str:
+    del request  # Credentials and arbitrary upstream text are never reflected.
     message = " ".join(str(error or "").split())
-    if str(DATA_ROOT) in message:
-        message = message.replace(str(DATA_ROOT), "<job>")
-    deepseek_api_key = os.getenv("PDF2ZH_DEEPSEEK_API_KEY", "").strip()
-    if deepseek_api_key:
-        message = message.replace(deepseek_api_key, "<redacted>")
-    message = re.sub(
-        r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}",
-        "Bearer <redacted>",
-        message,
-    )
-    message = re.sub(
-        r"(?i)\b(api[-_ ]?key|authorization|access[-_ ]?token)\s*[:=]\s*"
-        r"(?:bearer\s+)?[^\s,;]+",
-        r"\1=<redacted>",
-        message,
-    )
-    message = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted>", message)
-    return message[:240] or "翻译服务发生未知错误"
+    if message in PUBLIC_FAILURE_MESSAGES:
+        return message
+    normalized = message.casefold()
+    if any(
+        marker in normalized
+        for marker in (
+            "authentication",
+            "unauthorized",
+            "authorization",
+            "api_key",
+            "api key",
+            "invalid api key",
+            "incorrect api key",
+            "status 401",
+            "status code: 401",
+            "status 403",
+            "status code: 403",
+        )
+    ):
+        return "翻译渠道认证失败，请联系管理员检查密钥"
+    if any(
+        marker in normalized
+        for marker in (
+            "rate limit",
+            "too many requests",
+            "quota",
+            "billing",
+            "status 429",
+            "status code: 429",
+        )
+    ):
+        return "翻译渠道请求过于频繁或额度不足，请稍后重试"
+    if any(marker in normalized for marker in ("timeout", "timed out")):
+        return "翻译渠道响应超时，请稍后重试"
+    if any(
+        marker in normalized
+        for marker in (
+            "connection",
+            "connect error",
+            "dns",
+            "name resolution",
+            "network is unreachable",
+        )
+    ):
+        return "无法连接翻译渠道，请稍后重试"
+    if any(
+        marker in normalized
+        for marker in (
+            "bad request",
+            "invalid_request",
+            "model not found",
+            "status 400",
+            "status code: 400",
+            "status 404",
+            "status code: 404",
+            "status 422",
+            "status code: 422",
+        )
+    ):
+        return "翻译渠道拒绝了请求，请联系管理员检查模型配置"
+    return "翻译服务暂时无法完成任务，请稍后重试"
 
 
-def _fail_stop_worker(job_id: str, error: BaseException) -> None:
+def _safe_public_label(value: object) -> str:
+    label = " ".join(str(value or "").split())
+    return label[:120] or "已配置渠道"
+
+
+def _fail_stop_worker(
+    job_id: str,
+    error: BaseException,
+    request: TranslationRequest | None = None,
+) -> None:
+    del request
     logger.critical(
-        "Job %s cleanup could not be proven complete; failing the container: %s",
+        "Job %s cleanup could not be proven complete; failing the container (%s)",
         job_id,
-        error,
+        type(error).__name__,
     )
     os._exit(70)
 
@@ -818,16 +1249,15 @@ def _arm_cancel_watchdog(job: WorkerJob) -> None:
 @app.get("/internal/health")
 async def health(_: WorkerAuth) -> dict:
     active = sum(1 for job in _jobs.values() if not job.terminal)
-    providers = ["google"]
-    if os.getenv("PDF2ZH_DEEPSEEK_API_KEY", "").strip():
-        providers.append("deepseek")
     return {
-        "status": "ok",
+        "status": "ok" if _accepting_jobs else "draining",
         "provider": "google",
-        "providers": providers,
+        "providers": ["google", "deepseek", "openai_compatible"],
         "active_jobs": active,
         "accepting_jobs": _accepting_jobs,
         "epoch": WORKER_EPOCH,
+        "container_boot_id": CONTAINER_BOOT_ID,
+        "max_active_jobs": 1,
     }
 
 
@@ -839,7 +1269,11 @@ async def fail_stop_worker(
     exit_timer = threading.Timer(0.05, os._exit, args=(70,))
     exit_timer.daemon = True
     exit_timer.start()
-    return {"status": "terminating", "epoch": WORKER_EPOCH}
+    return {
+        "status": "terminating",
+        "epoch": WORKER_EPOCH,
+        "container_boot_id": CONTAINER_BOOT_ID,
+    }
 
 
 @app.post("/internal/jobs/{job_id}", response_model=WorkerState, status_code=202)
@@ -1027,7 +1461,7 @@ async def resume_worker(
     global _accepting_jobs
     async with _jobs_lock:
         active = sum(1 for job in _jobs.values() if not job.terminal)
-        if active:
+        if active or _retire_requested:
             return WorkerControlState(status="draining", active_jobs=active)
         _accepting_jobs = True
     return WorkerControlState(status="ready", active_jobs=0)

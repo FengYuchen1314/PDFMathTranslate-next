@@ -1,34 +1,30 @@
-import {
-  act,
-  fireEvent,
-  render,
-  renderHook,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
-import type { JobDraft } from "./types";
-import { mergeJobUpdate, useTranslationJob } from "./useTranslationJob";
+import type { AdminProvider, AdminSession, AppConfig } from "./types";
 
-const CONFIG = {
+const PUBLIC_CONFIG: AppConfig = {
   provider: "google",
   providers: [
-    { id: "google", name: "Google", available: true },
+    {
+      id: "google",
+      kind: "google",
+      name: "Google",
+      available: true,
+      models: [],
+    },
     {
       id: "deepseek",
+      kind: "deepseek",
       name: "DeepSeek",
-      available: false,
-      unavailableReason: "not_configured",
+      available: true,
       models: [
-        { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+        { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", isDefault: true },
         { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" },
       ],
-      defaultModel: "deepseek-v4-flash",
-      thinkingModes: ["enabled", "disabled"],
+      thinkingModes: ["default", "enabled", "disabled"],
       reasoningEfforts: ["low", "high", "max"],
       defaultReasoningEffort: "high",
     },
@@ -40,44 +36,27 @@ const CONFIG = {
   ],
 };
 
-const DEEPSEEK_CONFIG = {
-  ...CONFIG,
-  providers: CONFIG.providers.map((provider) =>
-    provider.id === "deepseek" ? { ...provider, available: true } : provider,
-  ),
+const AUTHENTICATED_SESSION: AdminSession = {
+  setupRequired: false,
+  setupTokenRequired: false,
+  authenticated: true,
+  username: "admin",
+  csrfToken: "csrf-test-token",
 };
 
-const TEST_DRAFT: JobDraft = {
-  provider: "google",
-  deepseekModel: "deepseek-v4-flash",
-  deepseekThinkingMode: "",
-  deepseekReasoningEffort: "high",
-  sourceLang: "en",
-  targetLang: "zh",
-  pages: "",
-  outputMono: true,
-  outputDual: true,
+const DEEPSEEK_PROVIDER: AdminProvider = {
+  id: "deepseek",
+  kind: "deepseek",
+  name: "DeepSeek",
+  baseUrl: "https://api.deepseek.com",
+  enabled: false,
+  hasApiKey: false,
+  revision: 3,
+  models: [
+    { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", isDefault: true },
+    { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", isDefault: false },
+  ],
 };
-
-function testPdf(): File {
-  return new File(["pdf"], "paper.pdf", { type: "application/pdf" });
-}
-
-function reservedJobId(init?: RequestInit): string {
-  const jobId = new Headers(init?.headers).get("x-job-id");
-  if (!jobId) {
-    throw new Error("Missing x-job-id in create request");
-  }
-  return jobId;
-}
-
-async function flushAsyncWork(): Promise<void> {
-  await act(async () => {
-    for (let index = 0; index < 12; index += 1) {
-      await Promise.resolve();
-    }
-  });
-}
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
@@ -111,15 +90,10 @@ class FakeEventSource {
     }
   }
 
-  emit(data: unknown, type: "message" | "job" = "message") {
-    const event = new MessageEvent<string>(type, {
-      data: JSON.stringify(data),
-    });
-    if (type === "job") {
-      this.jobListeners.forEach((listener) => listener(event));
-    } else {
-      this.onmessage?.(event);
-    }
+  emit(data: unknown) {
+    this.onmessage?.(
+      new MessageEvent<string>("message", { data: JSON.stringify(data) }),
+    );
   }
 }
 
@@ -134,712 +108,506 @@ function emptyResponse(status = 204): Response {
   return new Response(null, { status });
 }
 
-function installFetch(job: Record<string, unknown>) {
-  const fetchMock = vi.fn(
-    async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      const url = String(input);
-      if (url === "/api/health") return jsonResponse({ ok: true });
-      if (url === "/api/config") return jsonResponse(CONFIG);
-      if (url.endsWith("/heartbeat")) return emptyResponse();
-      if (url.endsWith("/cancel") && init?.method === "POST") {
-        return jsonResponse({ ...job, status: "cancelling" });
-      }
-      if (url === `/api/jobs/${job.id}` && init?.method === "DELETE") {
-        return emptyResponse();
-      }
-      if (url === `/api/jobs/${job.id}`) return jsonResponse(job);
-      throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
-    },
-  );
-  vi.stubGlobal("fetch", fetchMock);
-  return fetchMock;
+function requestPath(input: RequestInfo | URL): string {
+  return new URL(String(input), "http://localhost").pathname;
 }
 
-describe("PDF translation workbench", () => {
+function testPdf(): File {
+  return new File(["pdf"], "paper.pdf", { type: "application/pdf" });
+}
+
+describe("practical translation page", () => {
   beforeEach(() => {
+    window.history.replaceState({}, "", "/");
     FakeEventSource.instances = [];
     vi.stubGlobal("EventSource", FakeEventSource);
+    Object.defineProperty(navigator, "sendBeacon", {
+      configurable: true,
+      value: vi.fn(() => true),
+    });
   });
 
   afterEach(() => {
-    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
-  it("restores a running job and renders live SSE progress", async () => {
-    window.sessionStorage.setItem("pdf2zh.active-job-id", "job-running");
-    installFetch({
+  it("renders a simple accessible settings form without the old decorative shell", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (requestPath(input) === "/api/config") return jsonResponse(PUBLIC_CONFIG);
+        throw new Error(`Unexpected request: ${String(input)}`);
+      }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "PDF 翻译" })).toBeInTheDocument();
+    expect(screen.getByLabelText("PDF 文件")).toHaveAttribute("type", "file");
+    expect(screen.getByRole("checkbox", { name: "纯译文" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "双语对照" })).toBeChecked();
+    expect(screen.getByRole("link", { name: "管理后台" })).toHaveAttribute("href", "/admin");
+    expect(document.querySelector(".ambient")).not.toBeInTheDocument();
+    expect(screen.queryByText("让论文更容易阅读")).not.toBeInTheDocument();
+  });
+
+  it("does not pretend Google is available when public config cannot load", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("offline");
+      }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取服务配置");
+    expect(screen.getByRole("button", { name: "开始翻译" })).toBeDisabled();
+    expect(screen.queryByRole("option", { name: "Google" })).not.toBeInTheDocument();
+  });
+
+  it("restores, cancels and releases an active job without changing its lifecycle", async () => {
+    const runningJob = {
       id: "job-running",
       status: "running",
-      progress: 21,
-      stage: "解析页面",
-      message: "正在识别文档结构",
-    });
-
-    render(
-      <StrictMode>
-        <App />
-      </StrictMode>,
-    );
-
-    expect(await screen.findByText("正在处理文档")).toBeInTheDocument();
-    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "21");
-    expect(FakeEventSource.instances).toHaveLength(1);
-
-    FakeEventSource.instances[0].emit(
-      {
-        id: "job-running",
-        status: "running",
-        progress: 73,
-        stage: "翻译段落",
-        message: "已完成 73%",
-      },
-      "job",
-    );
-
-    await waitFor(() =>
-      expect(screen.getByRole("progressbar")).toHaveAttribute(
-        "aria-valuenow",
-        "73",
-      ),
-    );
-    expect(screen.getByText("翻译段落")).toBeInTheDocument();
-  });
-
-  it("optimistically enters cancelling state and calls the cancel endpoint", async () => {
-    const user = userEvent.setup();
-    window.sessionStorage.setItem("pdf2zh.active-job-id", "job-cancel");
-    const fetchMock = installFetch({
-      id: "job-cancel",
-      status: "running",
-      progress: 48,
-      stage: "翻译中",
-    });
-    render(<App />);
-
-    await user.click(await screen.findByRole("button", { name: "取消任务" }));
-
-    expect(await screen.findByText("正在安全停止任务")).toBeInTheDocument();
-    expect(
-      fetchMock.mock.calls.some(
-        ([url, init]) =>
-          String(url) === "/api/jobs/job-cancel/cancel" &&
-          (init as RequestInit | undefined)?.method === "POST",
-      ),
-    ).toBe(true);
-  });
-
-  it("retries a failed job with the newly selected PDF", async () => {
-    const user = userEvent.setup();
-    window.sessionStorage.setItem("pdf2zh.active-job-id", "job-failed");
-    const failedJob = {
-      id: "job-failed",
-      status: "failed",
       progress: 37,
-      stage: "翻译失败",
-      error: "Google 请求超时",
+      stage: "翻译正文",
+      message: "正在调用翻译服务",
+      options: {
+        providerId: "deepseek",
+        modelId: "deepseek-v4-pro",
+      },
     };
-    let created = false;
-    let createdId: string | null = null;
+    window.sessionStorage.setItem("pdf2zh.active-job-id", runningJob.id);
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const url = String(input);
-        if (url === "/api/health") return jsonResponse({ ok: true });
-        if (url === "/api/config") return jsonResponse(CONFIG);
-        if (url === "/api/jobs/job-failed") return jsonResponse(failedJob);
-        if (url === "/api/jobs" && init?.method === "POST") {
-          created = true;
-          createdId = reservedJobId(init);
-          return jsonResponse({ id: createdId, status: "queued" });
+        const path = requestPath(input);
+        if (path === "/api/config") return jsonResponse(PUBLIC_CONFIG);
+        if (path === `/api/jobs/${runningJob.id}/heartbeat`) return emptyResponse();
+        if (path === `/api/jobs/${runningJob.id}/cancel`) {
+          return jsonResponse({ ...runningJob, status: "cancelling" });
         }
-        if (url === "/api/jobs/job-failed/release") return emptyResponse();
-        if (createdId && url === `/api/jobs/${createdId}`) {
-          return jsonResponse({
-            id: createdId,
-            status: "running",
-            progress: 2,
-            stage: "正在准备",
-          });
-        }
-        if (url.endsWith("/heartbeat")) return emptyResponse();
-        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
+        if (path === `/api/jobs/${runningJob.id}`) return jsonResponse(runningJob);
+        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
       },
     );
     vi.stubGlobal("fetch", fetchMock);
+
     render(<App />);
 
-    expect(await screen.findByText("这次翻译没有完成")).toBeInTheDocument();
-    const fileInput = screen.getByLabelText("选择 PDF 文件") as HTMLInputElement;
-    const pdf = new File(["pdf"], "paper.pdf", { type: "application/pdf" });
-    await user.upload(fileInput, pdf);
-    await user.click(screen.getByRole("button", { name: "重新提交" }));
-
-    await waitFor(() => expect(created).toBe(true));
-    const createCall = fetchMock.mock.calls.find(
-      ([url, init]) =>
-        String(url) === "/api/jobs" &&
-        (init as RequestInit | undefined)?.method === "POST",
+    const progress = await screen.findByRole("progressbar", { name: "翻译进度" });
+    expect(progress.tagName).toBe("PROGRESS");
+    expect(progress).toHaveAttribute("value", "37");
+    expect(screen.getByText("DeepSeek / DeepSeek V4 Pro")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "取消任务" }));
+    expect(await screen.findByText("正在取消", { selector: ".status" })).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/jobs/job-running/cancel",
+      expect.objectContaining({ method: "POST" }),
     );
-    expect(createCall).toBeDefined();
-    expect((createCall?.[1] as RequestInit).body).toBeInstanceOf(FormData);
-    const createForm = (createCall?.[1] as RequestInit).body as FormData;
-    expect(createForm.get("provider")).toBe("google");
-    expect(createForm.has("deepseek_model")).toBe(false);
-    expect(createForm.has("deepseek_thinking_mode")).toBe(false);
-    expect(createForm.has("deepseek_reasoning_effort")).toBe(false);
-    expect(
-      ((createCall?.[1] as RequestInit).headers as Record<string, string>)[
-        "x-job-id"
-      ],
-    ).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-    expect(await screen.findByText("正在处理文档")).toBeInTheDocument();
+
+    act(() => {
+      window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: false }));
+    });
+    expect(navigator.sendBeacon).toHaveBeenCalledWith(
+      "/api/jobs/job-running/release",
+    );
   });
 
-  it("submits only the current DeepSeek V4 fields selected in the UI", async () => {
+  it("submits only dynamic provider/model IDs and never public credentials", async () => {
     const user = userEvent.setup();
-    let submitted: FormData | null = null;
-    let submittedId = "";
+    const customConfig: AppConfig = {
+      ...PUBLIC_CONFIG,
+      csrfToken: "csrf-test-token",
+      providers: [
+        PUBLIC_CONFIG.providers[0],
+        {
+          id: "lab-channel",
+          kind: "openai_compatible",
+          name: "实验室模型",
+          available: true,
+          models: [
+            { id: "model-a", name: "模型 A", isDefault: true },
+            { id: "model-b", name: "模型 B" },
+          ],
+        },
+      ],
+    };
+    let submittedForm: FormData | null = null;
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const url = String(input);
-        if (url === "/api/health") return jsonResponse({ ok: true });
-        if (url === "/api/config") return jsonResponse(DEEPSEEK_CONFIG);
-        if (url === "/api/jobs" && init?.method === "POST") {
-          submitted = init.body as FormData;
-          submittedId = reservedJobId(init);
-          return jsonResponse({ id: submittedId, status: "queued" });
+        const path = requestPath(input);
+        if (path === "/api/config") return jsonResponse(customConfig);
+        if (path === "/api/jobs" && init?.method === "POST") {
+          submittedForm = init.body as FormData;
+          const id = new Headers(init.headers).get("x-job-id") ?? "job-new";
+          return jsonResponse({ id, status: "queued" });
         }
-        if (submittedId && url === `/api/jobs/${submittedId}/heartbeat`) {
+        if (path.startsWith("/api/jobs/") && path.endsWith("/heartbeat")) {
           return emptyResponse();
         }
-        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
-      },
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    render(<App />);
-
-    const providerSelect = await screen.findByLabelText("翻译渠道");
-    await waitFor(() =>
-      expect(screen.getByRole("option", { name: "DeepSeek" })).not.toBeDisabled(),
-    );
-    await user.selectOptions(providerSelect, "deepseek");
-    await user.selectOptions(screen.getByLabelText("DeepSeek 模型"), "deepseek-v4-pro");
-    await user.selectOptions(
-      screen.getByLabelText("DeepSeek Thinking 模式"),
-      "enabled",
-    );
-    expect(screen.getByRole("option", { name: "Low" })).toBeInTheDocument();
-    await user.selectOptions(screen.getByLabelText("DeepSeek 推理强度"), "max");
-    await user.upload(screen.getByLabelText("选择 PDF 文件"), testPdf());
-    await user.click(screen.getByRole("button", { name: "开始翻译" }));
-
-    await waitFor(() => expect(submitted).not.toBeNull());
-    const form = submitted as unknown as FormData;
-    expect(Array.from(form.keys())).toEqual([
-      "file",
-      "source_lang",
-      "target_lang",
-      "pages",
-      "output_mono",
-      "output_dual",
-      "provider",
-      "deepseek_model",
-      "deepseek_thinking_mode",
-      "deepseek_reasoning_effort",
-    ]);
-    expect(form.get("provider")).toBe("deepseek");
-    expect(form.get("deepseek_model")).toBe("deepseek-v4-pro");
-    expect(form.get("deepseek_thinking_mode")).toBe("enabled");
-    expect(form.get("deepseek_reasoning_effort")).toBe("max");
-    expect(screen.getAllByText("DeepSeek").length).toBeGreaterThan(0);
-    expect(screen.getByText("翻译渠道：DeepSeek")).toBeInTheDocument();
-  });
-
-  it("omits DeepSeek reasoning effort when thinking is explicitly disabled", async () => {
-    const user = userEvent.setup();
-    let submitted: FormData | null = null;
-    const fetchMock = vi.fn(
-      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const url = String(input);
-        if (url === "/api/health") return jsonResponse({ ok: true });
-        if (url === "/api/config") return jsonResponse(DEEPSEEK_CONFIG);
-        if (url === "/api/jobs" && init?.method === "POST") {
-          submitted = init.body as FormData;
-          return jsonResponse({ id: reservedJobId(init), status: "queued" });
-        }
-        if (url.endsWith("/heartbeat")) return emptyResponse();
-        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
-      },
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    render(<App />);
-
-    await waitFor(() =>
-      expect(screen.getByRole("option", { name: "DeepSeek" })).not.toBeDisabled(),
-    );
-    await user.selectOptions(screen.getByLabelText("翻译渠道"), "deepseek");
-    expect(screen.queryByLabelText("DeepSeek 推理强度")).not.toBeInTheDocument();
-    await user.selectOptions(
-      screen.getByLabelText("DeepSeek Thinking 模式"),
-      "disabled",
-    );
-    expect(screen.queryByLabelText("DeepSeek 推理强度")).not.toBeInTheDocument();
-    await user.upload(screen.getByLabelText("选择 PDF 文件"), testPdf());
-    await user.click(screen.getByRole("button", { name: "开始翻译" }));
-
-    await waitFor(() => expect(submitted).not.toBeNull());
-    const form = submitted as unknown as FormData;
-    expect(form.get("deepseek_thinking_mode")).toBe("disabled");
-    expect(form.has("deepseek_reasoning_effort")).toBe(false);
-  });
-
-  it("shows DeepSeek as disabled when the server has no API key", async () => {
-    installFetch({ id: "unused", status: "queued" });
-    render(<App />);
-
-    const unavailable = await screen.findByRole("option", {
-      name: "DeepSeek（服务器未配置）",
-    });
-    expect(unavailable).toBeDisabled();
-    expect(screen.getByLabelText("翻译渠道")).toHaveValue("google");
-  });
-
-  it("preserves a stored DeepSeek choice while the provider is unavailable", async () => {
-    window.localStorage.setItem(
-      "pdf2zh.translation-draft",
-      JSON.stringify({
-        ...TEST_DRAFT,
-        provider: "deepseek",
-      }),
-    );
-    installFetch({ id: "unused", status: "queued" });
-    render(<App />);
-
-    expect(
-      await screen.findByRole("option", { name: "DeepSeek（服务器未配置）" }),
-    ).toBeDisabled();
-    expect(screen.getByLabelText("翻译渠道")).toHaveValue("deepseek");
-    await waitFor(() => {
-      const stored = JSON.parse(
-        window.localStorage.getItem("pdf2zh.translation-draft") ?? "{}",
-      ) as Record<string, unknown>;
-      expect(stored.provider).toBe("deepseek");
-    });
-  });
-
-  it("loads an old Google-only draft with the new provider defaults", async () => {
-    window.localStorage.setItem(
-      "pdf2zh.translation-draft",
-      JSON.stringify({
-        sourceLang: "en",
-        targetLang: "zh",
-        pages: "1-2",
-        outputMono: true,
-        outputDual: false,
-      }),
-    );
-    installFetch({ id: "unused", status: "queued" });
-    render(<App />);
-
-    expect(await screen.findByLabelText("翻译渠道")).toHaveValue("google");
-    expect(
-      screen.getByPlaceholderText("留空翻译全部，如 1-3, 5, 8-10"),
-    ).toHaveValue("1-2");
-    await waitFor(() => {
-      const stored = JSON.parse(
-        window.localStorage.getItem("pdf2zh.translation-draft") ?? "{}",
-      ) as Record<string, unknown>;
-      expect(stored).toMatchObject({
-        provider: "google",
-        deepseekModel: "deepseek-v4-flash",
-        deepseekThinkingMode: "",
-        deepseekReasoningEffort: "high",
-      });
-    });
-  });
-
-  it("releases an active job with a beacon on pagehide", async () => {
-    window.sessionStorage.setItem("pdf2zh.active-job-id", "job-pagehide");
-    installFetch({
-      id: "job-pagehide",
-      status: "running",
-      progress: 8,
-      stage: "准备中",
-    });
-    const sendBeacon = vi.fn(() => true);
-    Object.defineProperty(navigator, "sendBeacon", {
-      configurable: true,
-      value: sendBeacon,
-    });
-    render(<App />);
-    await screen.findByText("正在处理文档");
-
-    const event = new Event("pagehide") as PageTransitionEvent;
-    Object.defineProperty(event, "persisted", { value: false });
-    fireEvent(window, event);
-
-    expect(sendBeacon).toHaveBeenCalledWith(
-      "/api/jobs/job-pagehide/release",
-    );
-
-    fireEvent(window, new Event("pageshow"));
-    expect(sendBeacon).toHaveBeenLastCalledWith(
-      "/api/jobs/job-pagehide/heartbeat",
-    );
-  });
-
-  it("does not release a job when pagehide enters the back-forward cache", async () => {
-    window.sessionStorage.setItem("pdf2zh.active-job-id", "job-bfcache");
-    installFetch({
-      id: "job-bfcache",
-      status: "running",
-      progress: 18,
-      stage: "翻译中",
-    });
-    const sendBeacon = vi.fn(() => true);
-    Object.defineProperty(navigator, "sendBeacon", {
-      configurable: true,
-      value: sendBeacon,
-    });
-    render(<App />);
-    await screen.findByText("正在处理文档");
-
-    const event = new Event("pagehide") as PageTransitionEvent;
-    Object.defineProperty(event, "persisted", { value: true });
-    fireEvent(window, event);
-
-    expect(sendBeacon).not.toHaveBeenCalledWith(
-      "/api/jobs/job-bfcache/release",
-    );
-  });
-
-  it("heartbeats a terminal job on pageshow to revoke release grace", async () => {
-    window.sessionStorage.setItem("pdf2zh.active-job-id", "job-terminal-page");
-    installFetch({
-      id: "job-terminal-page",
-      status: "succeeded",
-      progress: 100,
-      stage: "已完成",
-      files: { mono: true, dual: true },
-    });
-    const sendBeacon = vi.fn(() => true);
-    Object.defineProperty(navigator, "sendBeacon", {
-      configurable: true,
-      value: sendBeacon,
-    });
-    render(<App />);
-    await screen.findByText("译稿已准备好");
-
-    const event = new Event("pagehide") as PageTransitionEvent;
-    Object.defineProperty(event, "persisted", { value: false });
-    fireEvent(window, event);
-    expect(sendBeacon).toHaveBeenCalledWith(
-      "/api/jobs/job-terminal-page/release",
-    );
-
-    fireEvent(window, new Event("pageshow"));
-    expect(sendBeacon).toHaveBeenLastCalledWith(
-      "/api/jobs/job-terminal-page/heartbeat",
-    );
-  });
-
-  it("continues periodic heartbeats while a terminal result page stays open", async () => {
-    vi.useFakeTimers();
-    window.sessionStorage.setItem("pdf2zh.active-job-id", "job-terminal-lease");
-    const fetchMock = installFetch({
-      id: "job-terminal-lease",
-      status: "succeeded",
-      progress: 100,
-      stage: "已完成",
-      files: { mono: true },
-    });
-    renderHook(() => useTranslationJob());
-    await flushAsyncWork();
-
-    const heartbeatCount = () =>
-      fetchMock.mock.calls.filter(
-        ([url, init]) =>
-          String(url) === "/api/jobs/job-terminal-lease/heartbeat" &&
-          (init as RequestInit | undefined)?.method === "POST",
-      ).length;
-
-    expect(heartbeatCount()).toBe(1);
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(9_999);
-    });
-    await flushAsyncWork();
-    expect(heartbeatCount()).toBe(1);
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1);
-    });
-    await flushAsyncWork();
-    expect(heartbeatCount()).toBe(2);
-  });
-
-  it("deletes a terminal job when the workbench is cleared", async () => {
-    const user = userEvent.setup();
-    window.sessionStorage.setItem("pdf2zh.active-job-id", "job-delete");
-    const fetchMock = installFetch({
-      id: "job-delete",
-      status: "succeeded",
-      progress: 100,
-      stage: "已完成",
-      files: { mono: true },
-    });
-    render(<App />);
-
-    await user.click(
-      await screen.findByRole("button", { name: "翻译另一份" }),
-    );
-
-    await waitFor(() =>
-      expect(
-        fetchMock.mock.calls.some(
-          ([url, init]) =>
-            String(url) === "/api/jobs/job-delete" &&
-            (init as RequestInit | undefined)?.method === "DELETE",
-        ),
-      ).toBe(true),
-    );
-    expect(
-      fetchMock.mock.calls.some(
-        ([url]) => String(url) === "/api/jobs/job-delete/release",
-      ),
-    ).toBe(false);
-    expect(window.sessionStorage.getItem("pdf2zh.active-job-id")).toBeNull();
-  });
-
-  it("keeps one reserved ID locked while a 409 upload later becomes a job", async () => {
-    vi.useFakeTimers();
-    let jobId = "";
-    let createCount = 0;
-    let lookupCount = 0;
-    const fetchMock = vi.fn(
-      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const url = String(input);
-        if (url.endsWith("/heartbeat")) return emptyResponse();
-        if (url === "/api/jobs" && init?.method === "POST") {
-          createCount += 1;
-          jobId = reservedJobId(init);
-          throw new TypeError("创建响应连接中断");
-        }
-        if (jobId && url === `/api/jobs/${jobId}`) {
-          lookupCount += 1;
-          if (lookupCount === 1) {
-            return jsonResponse({ error: "任务仍在上传" }, 409);
-          }
+        if (path.startsWith("/api/jobs/")) {
           return jsonResponse({
-            id: jobId,
-            status: "running",
-            progress: 3,
-            stage: "解析页面",
-          });
-        }
-        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
-      },
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    const { result } = renderHook(() => useTranslationJob());
-
-    let startPromise!: Promise<void>;
-    act(() => {
-      startPromise = result.current.start(testPdf(), TEST_DRAFT);
-    });
-    await flushAsyncWork();
-
-    expect(createCount).toBe(1);
-    expect(lookupCount).toBe(1);
-    expect(result.current.creating).toBe(true);
-    expect(result.current.job).toBeNull();
-    expect(window.sessionStorage.getItem("pdf2zh.active-job-id")).toBe(jobId);
-
-    act(() => {
-      void result.current.start(testPdf(), TEST_DRAFT);
-    });
-    await flushAsyncWork();
-    expect(createCount).toBe(1);
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(4_000);
-    });
-    await flushAsyncWork();
-    await act(async () => {
-      await startPromise;
-    });
-
-    expect(lookupCount).toBe(2);
-    expect(result.current.creating).toBe(false);
-    expect(result.current.job).toMatchObject({ id: jobId, status: "running" });
-  });
-
-  it("keeps the reserved ID through a recovery network error", async () => {
-    vi.useFakeTimers();
-    let jobId = "";
-    let createCount = 0;
-    let lookupCount = 0;
-    const fetchMock = vi.fn(
-      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const url = String(input);
-        if (url.endsWith("/heartbeat")) return emptyResponse();
-        if (url === "/api/jobs" && init?.method === "POST") {
-          createCount += 1;
-          jobId = reservedJobId(init);
-          throw new TypeError("创建响应连接中断");
-        }
-        if (jobId && url === `/api/jobs/${jobId}`) {
-          lookupCount += 1;
-          if (lookupCount === 1) {
-            throw new TypeError("恢复查询暂时离线");
-          }
-          return jsonResponse({
-            id: jobId,
+            id: path.split("/").at(-1),
             status: "queued",
             progress: 0,
-            stage: "等待调度",
           });
         }
-        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
+        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
       },
     );
     vi.stubGlobal("fetch", fetchMock);
-    const { result } = renderHook(() => useTranslationJob());
 
-    let startPromise!: Promise<void>;
-    act(() => {
-      startPromise = result.current.start(testPdf(), TEST_DRAFT);
-    });
-    await flushAsyncWork();
+    render(<App />);
+    await screen.findByRole("option", { name: "实验室模型" });
+    await user.selectOptions(screen.getByLabelText("翻译渠道"), "lab-channel");
+    await user.selectOptions(screen.getByLabelText("模型"), "model-b");
+    await user.upload(screen.getByLabelText("PDF 文件"), testPdf());
+    await user.click(screen.getByRole("button", { name: "开始翻译" }));
 
-    expect(createCount).toBe(1);
-    expect(lookupCount).toBe(1);
-    expect(result.current.creating).toBe(true);
-    expect(window.sessionStorage.getItem("pdf2zh.active-job-id")).toBe(jobId);
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(4_000);
-    });
-    await flushAsyncWork();
-    await act(async () => {
-      await startPromise;
-    });
-
-    expect(createCount).toBe(1);
-    expect(lookupCount).toBe(2);
-    expect(result.current.creating).toBe(false);
-    expect(result.current.job).toMatchObject({ id: jobId, status: "queued" });
+    await waitFor(() => expect(submittedForm).not.toBeNull());
+    const submitCall = fetchMock.mock.calls.find(
+      ([input]) => requestPath(input as RequestInfo | URL) === "/api/jobs",
+    );
+    const form = submitCall?.[1]?.body;
+    expect(form).toBeInstanceOf(FormData);
+    if (!(form instanceof FormData)) throw new Error("翻译请求缺少 FormData");
+    expect(form.get("provider_id")).toBe("lab-channel");
+    expect(form.get("model_id")).toBe("model-b");
+    expect(form.has("provider")).toBe(false);
+    expect(form.has("api_key")).toBe(false);
+    expect(form.has("base_url")).toBe(false);
+    expect(form.has("deepseek_model")).toBe(false);
+    expect(new Headers(submitCall?.[1]?.headers).get("X-CSRF-Token")).toBe(
+      "csrf-test-token",
+    );
   });
 
-  it("unlocks a new submission only after a definitive 404", async () => {
-    const requestedIds: string[] = [];
+  it("tombstones an ambiguous create before a delayed POST can become orphaned", async () => {
+    const user = userEvent.setup();
+    let reservedJobId = "";
+    let tombstoned = false;
+    let lateJobCreated = false;
+    let releaseWorkerHealth: (() => void) | undefined;
+    const workerHealthGate = new Promise<void>((resolve) => {
+      releaseWorkerHealth = resolve;
+    });
+    let delayedServerPost: Promise<"accepted" | "gone"> | null = null;
+
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const url = String(input);
-        if (url.endsWith("/heartbeat")) return emptyResponse();
-        if (url === "/api/jobs" && init?.method === "POST") {
-          const jobId = reservedJobId(init);
-          requestedIds.push(jobId);
-          if (requestedIds.length === 1) {
-            throw new TypeError("创建响应连接中断");
-          }
-          return jsonResponse({ id: jobId, status: "queued" });
-        }
-        if (requestedIds[0] && url === `/api/jobs/${requestedIds[0]}`) {
-          return jsonResponse({ error: "任务不存在" }, 404);
-        }
-        if (requestedIds[1] && url === `/api/jobs/${requestedIds[1]}`) {
-          return jsonResponse({
-            id: requestedIds[1],
-            status: "running",
-            progress: 1,
-            stage: "正在准备",
+        const path = requestPath(input);
+        const method = init?.method ?? "GET";
+        if (path === "/api/config") return jsonResponse(PUBLIC_CONFIG);
+        if (path === "/api/jobs" && method === "POST") {
+          reservedJobId = new Headers(init?.headers).get("x-job-id") ?? "";
+          delayedServerPost = workerHealthGate.then(() => {
+            if (tombstoned) return "gone";
+            lateJobCreated = true;
+            return "accepted";
           });
+          // The browser loses the response while the server-side handler is
+          // still awaiting worker health and has not reserved this UUID yet.
+          throw new TypeError("translation response lost");
         }
-        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${url}`);
+        if (path === `/api/jobs/${reservedJobId}/release` && method === "POST") {
+          tombstoned = true;
+          releaseWorkerHealth?.();
+          return emptyResponse(202);
+        }
+        if (path === `/api/jobs/${reservedJobId}` && method === "GET") {
+          if (lateJobCreated) {
+            return jsonResponse({ id: reservedJobId, status: "queued" });
+          }
+          return jsonResponse(
+            { error: tombstoned ? "retired" : "not found" },
+            tombstoned ? 410 : 404,
+          );
+        }
+        throw new Error(`Unexpected request: ${method} ${path}`);
       },
     );
     vi.stubGlobal("fetch", fetchMock);
-    const { result } = renderHook(() => useTranslationJob());
 
-    let firstStart!: Promise<void>;
-    act(() => {
-      firstStart = result.current.start(testPdf(), TEST_DRAFT);
-    });
-    await act(async () => {
-      await firstStart;
-    });
+    render(<App />);
+    await screen.findByRole("option", { name: "Google" });
+    await user.upload(screen.getByLabelText("PDF 文件"), testPdf());
+    await user.click(screen.getByRole("button", { name: "开始翻译" }));
 
-    expect(requestedIds).toHaveLength(1);
-    expect(result.current.creating).toBe(false);
-    expect(result.current.job).toBeNull();
-    expect(result.current.actionError).toContain("可以重新提交");
+    expect(
+      await screen.findByText(/服务已安全退休原任务编号，可以重新提交/),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "开始翻译" })).toBeEnabled(),
+    );
+    expect(reservedJobId).toMatch(/^[0-9a-f-]{36}$/);
     expect(window.sessionStorage.getItem("pdf2zh.active-job-id")).toBeNull();
+    await expect(delayedServerPost).resolves.toBe("gone");
+    expect(lateJobCreated).toBe(false);
 
-    let secondStart!: Promise<void>;
-    act(() => {
-      secondStart = result.current.start(testPdf(), TEST_DRAFT);
-    });
-    await act(async () => {
-      await secondStart;
-    });
-
-    expect(requestedIds).toHaveLength(2);
-    expect(requestedIds[1]).not.toBe(requestedIds[0]);
-    expect(result.current.creating).toBe(false);
-    expect(result.current.job).toMatchObject({
-      id: requestedIds[1],
-      status: "running",
-    });
+    const jobRequests = fetchMock.mock.calls
+      .map(([input, init]) => `${init?.method ?? "GET"} ${requestPath(input)}`)
+      .filter(
+        (request) =>
+          request.startsWith("POST /api/jobs") ||
+          request.startsWith("GET /api/jobs"),
+      );
+    expect(jobRequests).toEqual([
+      "POST /api/jobs",
+      `GET /api/jobs/${reservedJobId}`,
+      `POST /api/jobs/${reservedJobId}/release`,
+      `GET /api/jobs/${reservedJobId}`,
+    ]);
   });
 
-  it("ignores a late event from an earlier task", () => {
-    const current = {
-      id: "job-new",
-      status: "running" as const,
-      progress: 12,
-      stage: "新任务",
-    };
+  it("migrates the previous DeepSeek draft without persisting a credential", async () => {
+    window.localStorage.setItem(
+      "pdf2zh.translation-draft",
+      JSON.stringify({
+        provider: "deepseek",
+        deepseekModel: "deepseek-v4-pro",
+        deepseekThinkingMode: "enabled",
+        deepseekReasoningEffort: "max",
+        sourceLang: "en",
+        targetLang: "zh",
+        outputMono: true,
+        outputDual: false,
+        apiKey: "must-not-survive",
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (requestPath(input) === "/api/config") return jsonResponse(PUBLIC_CONFIG);
+        throw new Error(`Unexpected request: ${String(input)}`);
+      }),
+    );
 
-    expect(
-      mergeJobUpdate(
-        current,
-        { id: "job-old", status: "succeeded", progress: 100 },
-        "job-old",
-      ),
-    ).toEqual(current);
+    render(<App />);
+
+    expect(await screen.findByLabelText("翻译渠道")).toHaveValue("deepseek");
+    expect(screen.getByLabelText("模型")).toHaveValue("deepseek-v4-pro");
+    const persisted = window.localStorage.getItem("pdf2zh.translation-draft") ?? "";
+    expect(persisted).not.toContain("must-not-survive");
+    expect(JSON.parse(persisted)).toMatchObject({
+      providerId: "deepseek",
+      modelId: "deepseek-v4-pro",
+      thinkingMode: "enabled",
+      reasoningEffort: "max",
+    });
+  });
+});
+
+describe("administrator page", () => {
+  beforeEach(() => {
+    window.history.replaceState({}, "", "/admin");
   });
 
-  it("does not let a stale active snapshot reopen a terminal task", () => {
-    const terminal = {
-      id: "job-terminal",
-      status: "cancelled" as const,
-      revision: 9,
-      progress: 41,
-      message: "任务已取消",
-    };
-
-    expect(
-      mergeJobUpdate(
-        terminal,
-        {
-          id: "job-terminal",
-          status: "running",
-          revision: 8,
-          progress: 40,
-        },
-        "job-terminal",
-        true,
-      ),
-    ).toEqual(terminal);
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
-  it("keeps Rust API progress values in the documented 0–100 scale", () => {
-    expect(
-      mergeJobUpdate(
-        { id: "job-progress", status: "running", progress: 0 },
-        { id: "job-progress", status: "running", progress: 1 },
-        "job-progress",
-      )?.progress,
-    ).toBe(1);
+  it("shows the installation code only when required and creates the first admin", async () => {
+    const user = userEvent.setup();
+    let setupBody: Record<string, unknown> | null = null;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const path = requestPath(input);
+        if (path === "/api/admin/session") {
+          return jsonResponse({
+            setupRequired: true,
+            setupTokenRequired: true,
+            authenticated: false,
+          });
+        }
+        if (path === "/api/admin/setup" && init?.method === "POST") {
+          setupBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+          return jsonResponse(AUTHENTICATED_SESSION);
+        }
+        if (path === "/api/admin/providers") {
+          return jsonResponse({ providers: [DEEPSEEK_PROVIDER] });
+        }
+        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "创建首位管理员" })).toBeInTheDocument();
+    await user.type(screen.getByLabelText("安装码"), "install-once");
+    await user.type(screen.getByLabelText("用户名"), "owner");
+    await user.type(screen.getByLabelText("密码"), "a-secure-password");
+    await user.type(screen.getByLabelText("确认密码"), "a-secure-password");
+    await user.click(screen.getByRole("button", { name: "创建管理员" }));
+
+    expect(await screen.findByRole("heading", { name: "翻译渠道" })).toBeInTheDocument();
+    expect(setupBody).toEqual({
+      setupToken: "install-once",
+      username: "owner",
+      password: "a-secure-password",
+    });
+    expect(window.localStorage.getItem("install-once")).toBeNull();
+    expect(screen.queryByDisplayValue("install-once")).not.toBeInTheDocument();
+  });
+
+  it("logs in with an HttpOnly-cookie flow and sends CSRF on logout", async () => {
+    const user = userEvent.setup();
+    let authenticated = false;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const path = requestPath(input);
+        if (path === "/api/admin/session") {
+          return jsonResponse({
+            setupRequired: false,
+            setupTokenRequired: false,
+            authenticated: false,
+          });
+        }
+        if (path === "/api/admin/login" && init?.method === "POST") {
+          authenticated = true;
+          return jsonResponse(AUTHENTICATED_SESSION);
+        }
+        if (path === "/api/admin/providers" && authenticated) {
+          return jsonResponse({ providers: [DEEPSEEK_PROVIDER] });
+        }
+        if (path === "/api/admin/logout" && init?.method === "POST") {
+          authenticated = false;
+          return emptyResponse();
+        }
+        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "管理员登录" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("安装码")).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText("用户名"), "admin");
+    await user.type(screen.getByLabelText("密码"), "a-secure-password");
+    await user.click(screen.getByRole("button", { name: "登录" }));
+    await user.click(await screen.findByRole("button", { name: "退出登录" }));
+
+    expect(await screen.findByRole("heading", { name: "管理员登录" })).toBeInTheDocument();
+    const logoutCall = fetchMock.mock.calls.find(
+      ([input]) => requestPath(input as RequestInfo | URL) === "/api/admin/logout",
+    );
+    expect(new Headers(logoutCall?.[1]?.headers).get("X-CSRF-Token")).toBe(
+      "csrf-test-token",
+    );
+  });
+
+  it("stores a DeepSeek key only in the write request and clears the input immediately", async () => {
+    const user = userEvent.setup();
+    let savedProvider = DEEPSEEK_PROVIDER;
+    let savedBody: Record<string, unknown> | null = null;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const path = requestPath(input);
+        if (path === "/api/admin/session") return jsonResponse(AUTHENTICATED_SESSION);
+        if (path === "/api/admin/providers" && (!init?.method || init.method === "GET")) {
+          return jsonResponse({ providers: [savedProvider] });
+        }
+        if (path === "/api/admin/providers/deepseek" && init?.method === "PUT") {
+          savedBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+          savedProvider = {
+            ...DEEPSEEK_PROVIDER,
+            enabled: true,
+            hasApiKey: true,
+            revision: 4,
+          };
+          return jsonResponse(savedProvider);
+        }
+        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "翻译渠道" });
+    await user.click(screen.getByRole("button", { name: "配置 DeepSeek" }));
+    expect(screen.getByLabelText("渠道名称")).toHaveAttribute("readonly");
+    expect(screen.getByLabelText("API Base URL")).toHaveAttribute("readonly");
+    expect(screen.queryByRole("button", { name: "添加模型" })).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText("API 密钥"), "sk-deepseek-secret");
+    await user.click(screen.getByRole("checkbox", { name: "启用此渠道供管理员翻译使用" }));
+    await user.click(screen.getByRole("button", { name: "保存配置" }));
+
+    await waitFor(() => expect(screen.queryByLabelText("API 密钥")).not.toBeInTheDocument());
+    expect(savedBody).toMatchObject({
+      kind: "deepseek",
+      apiKey: "sk-deepseek-secret",
+      enabled: true,
+      expectedRevision: 3,
+    });
+    expect(JSON.stringify(window.localStorage)).not.toContain("sk-deepseek-secret");
+    expect(document.body).not.toHaveTextContent("sk-deepseek-secret");
+    const writeCall = fetchMock.mock.calls.find(
+      ([input]) => requestPath(input as RequestInfo | URL) === "/api/admin/providers/deepseek",
+    );
+    expect(new Headers(writeCall?.[1]?.headers).get("X-CSRF-Token")).toBe(
+      "csrf-test-token",
+    );
+  });
+
+  it("creates an OpenAI-compatible channel with multiple models and one default", async () => {
+    const user = userEvent.setup();
+    let savedBody: Record<string, unknown> | null = null;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const path = requestPath(input);
+        if (path === "/api/admin/session") return jsonResponse(AUTHENTICATED_SESSION);
+        if (path === "/api/admin/providers" && init?.method === "POST") {
+          savedBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+          return jsonResponse({
+            id: "lab",
+            revision: 1,
+            hasApiKey: true,
+            ...savedBody,
+          });
+        }
+        if (path === "/api/admin/providers") {
+          return jsonResponse({ providers: [DEEPSEEK_PROVIDER] });
+        }
+        throw new Error(`Unexpected request: ${init?.method ?? "GET"} ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "添加兼容渠道" }));
+    await user.type(screen.getByLabelText("渠道名称"), "实验室网关");
+    await user.type(screen.getByLabelText("API Base URL"), "http://llm.example.com/v1");
+    await user.click(screen.getByRole("button", { name: "保存配置" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("必须使用 https");
+    await user.clear(screen.getByLabelText("API Base URL"));
+    await user.type(screen.getByLabelText("API Base URL"), "https://llm.example.com/v1");
+    await user.type(screen.getByLabelText("API 密钥"), "sk-generic-secret");
+
+    let modelIds = screen.getAllByLabelText("模型 ID");
+    let modelNames = screen.getAllByLabelText("显示名称");
+    await user.type(modelIds[0], "model-a");
+    await user.type(modelNames[0], "模型 A");
+    await user.click(screen.getByRole("button", { name: "添加模型" }));
+    modelIds = screen.getAllByLabelText("模型 ID");
+    modelNames = screen.getAllByLabelText("显示名称");
+    await user.type(modelIds[1], "model-b");
+    await user.type(modelNames[1], "模型 B");
+    await user.click(screen.getAllByRole("radio", { name: "默认" })[1]);
+    await user.click(screen.getByRole("checkbox", { name: "启用此渠道供管理员翻译使用" }));
+    await user.click(screen.getByRole("button", { name: "保存配置" }));
+
+    await waitFor(() => expect(savedBody).not.toBeNull());
+    expect(savedBody).toMatchObject({
+      kind: "openai_compatible",
+      name: "实验室网关",
+      baseUrl: "https://llm.example.com/v1",
+      apiKey: "sk-generic-secret",
+      models: [
+        { id: "model-a", name: "模型 A", isDefault: false },
+        { id: "model-b", name: "模型 B", isDefault: true },
+      ],
+    });
+    expect(document.body).not.toHaveTextContent("sk-generic-secret");
   });
 });

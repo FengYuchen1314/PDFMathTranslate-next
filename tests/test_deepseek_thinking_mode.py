@@ -71,6 +71,37 @@ def test_deepseek_defaults_match_current_official_v4_api():
     assert transformed.openai_base_url == "https://api.deepseek.com"
 
 
+def test_openai_transport_ignores_environment_proxies_and_redirects():
+    settings = build_deepseek_settings("deepseek-v4-flash")
+    fake_client = FakeOpenAIClient()
+
+    with (
+        patch(
+            "pdf2zh_next.translator.translator_impl.openai.httpx.Client"
+        ) as http_client,
+        patch(
+            "pdf2zh_next.translator.translator_impl.openai.openai.OpenAI",
+            return_value=fake_client,
+        ),
+    ):
+        OpenAITranslator(settings, FakeRateLimiter())
+
+    assert http_client.call_args.kwargs["trust_env"] is False
+    assert http_client.call_args.kwargs["follow_redirects"] is False
+
+
+def test_openai_translator_redacts_its_request_key_from_errors():
+    settings = build_deepseek_settings("deepseek-v4-flash")
+    translator, _ = build_translator(settings)
+
+    message = translator._redacted_error(
+        RuntimeError("upstream returned Authorization: Bearer dummy-key")
+    )
+
+    assert "dummy-key" not in message
+    assert "<redacted>" in message
+
+
 def test_deepseek_v4_unforced_omits_extra_body_and_reasoning_effort():
     settings = build_deepseek_settings("deepseek-v4-flash")
     translator, fake_client = build_translator(settings)
@@ -115,7 +146,7 @@ def test_deepseek_v4_enabled_sends_extra_body_and_configured_effort():
     assert request_kwargs["reasoning_effort"] == "high"
 
 
-def test_deepseek_v4_pro_enabled_forwards_low_reasoning_effort():
+def test_deepseek_v4_pro_maps_low_reasoning_effort_to_official_high():
     settings = build_deepseek_settings(
         "deepseek-v4-pro",
         thinking_mode="enabled",
@@ -127,7 +158,7 @@ def test_deepseek_v4_pro_enabled_forwards_low_reasoning_effort():
 
     request_kwargs = fake_client.completions.calls[0]
     assert request_kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
-    assert request_kwargs["reasoning_effort"] == "low"
+    assert request_kwargs["reasoning_effort"] == "high"
 
 
 def test_deepseek_v4_enabled_without_effort_omits_reasoning_effort():
@@ -211,6 +242,21 @@ def test_deepseek_v4_cache_impact_distinguishes_thinking_modes():
         unforced_translator.cache.translate_engine_params
         != disabled_translator.cache.translate_engine_params
     )
+
+
+def test_openai_cache_namespace_changes_without_storing_api_keys():
+    first_settings = build_deepseek_settings("deepseek-v4-flash")
+    second_settings = build_deepseek_settings("deepseek-v4-flash")
+    second_settings.translate_engine_settings.openai_api_key = "rotated-dummy-key"
+    first_translator, _ = build_translator(first_settings)
+    second_translator, _ = build_translator(second_settings)
+
+    first_namespace = first_translator.cache.params["upstream_identity"]
+    second_namespace = second_translator.cache.params["upstream_identity"]
+    assert first_namespace != second_namespace
+    assert len(first_namespace) == 64
+    assert "dummy-key" not in first_translator.cache.translate_engine_params
+    assert "rotated-dummy-key" not in second_translator.cache.translate_engine_params
 
 
 def test_deepseek_settings_excludes_old_paired_thinking_bools():

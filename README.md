@@ -37,9 +37,11 @@
 PDF scientific paper translation and bilingual comparison. Based on [BabelDOC](https://github.com/funstory-ai/BabelDOC). Additionally, this project is also the official reference implementation for calling BabelDOC to perform PDF translation.
 
 > **This deployment branch uses a new web architecture.** The public service is a
-> Rust API and React single-page application; FastAPI is an internal BabelDOC
-> bridge. Google is always available, while server-configured DeepSeek uses the
-> current V4 Flash/Pro API without sending credentials through the browser. See
+> Rust API and practical React single-page application; FastAPI is an internal
+> BabelDOC bridge. Google is built in. The first administrator registers at
+> `/admin`, then stores DeepSeek or other HTTPS OpenAI-compatible providers in
+> the encrypted server-side provider store. API keys are never sent to or kept
+> by the browser. DeepSeek follows the current V4 Flash/Pro API. See
 > [docs/architecture-rust-fastapi.md](./docs/architecture-rust-fastapi.md) for the
 > lifecycle, cancellation guarantees, deployment, and verification commands.
 

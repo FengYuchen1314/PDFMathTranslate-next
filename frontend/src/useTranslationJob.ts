@@ -145,6 +145,45 @@ function parseEvent(event: MessageEvent<string>): unknown {
   }
 }
 
+async function resolveReservedJob(
+  reservedJobId: string,
+): Promise<TranslationJob | null> {
+  try {
+    return await getJob(reservedJobId);
+  } catch (error) {
+    if (error instanceof ApiRequestError && error.status === 410) {
+      return null;
+    }
+    if (!(error instanceof ApiRequestError) || error.status !== 404) {
+      throw error;
+    }
+  }
+
+  // A 404 is only an observation, not proof that a request whose response was
+  // lost cannot commit later. release() shares the backend's reservation gate:
+  // it either marks an already-created job as released or durably tombstones
+  // this exact UUID before an in-flight create can pass the same gate.
+  try {
+    await releaseJob(reservedJobId);
+  } catch (error) {
+    if (!(error instanceof ApiRequestError) || error.status !== 410) {
+      throw error;
+    }
+  }
+
+  try {
+    return await getJob(reservedJobId);
+  } catch (error) {
+    if (error instanceof ApiRequestError && error.status === 410) {
+      return null;
+    }
+    // In particular, never treat a second 404 as proof of absence. Retrying
+    // the whole sequence is safe and keeps the UI locked until the server
+    // exposes either the job or its durable tombstone.
+    throw error;
+  }
+}
+
 export interface TranslationJobController {
   job: TranslationJob | null;
   restoring: boolean;
@@ -156,7 +195,7 @@ export interface TranslationJobController {
   clear: () => void;
 }
 
-export function useTranslationJob(): TranslationJobController {
+export function useTranslationJob(csrfToken?: string | null): TranslationJobController {
   const [job, setJob] = useState<TranslationJob | null>(null);
   const [restoring, setRestoring] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -223,29 +262,22 @@ export function useTranslationJob(): TranslationJobController {
     let retryTimer: number | null = null;
     const restore = async () => {
       try {
-        const restoredJob = await getJob(storedJobId);
+        const restoredJob = await resolveReservedJob(storedJobId);
         if (!disposed) {
           if (pendingJobIdRef.current === storedJobId) {
             pendingJobIdRef.current = null;
           }
-          applyUpdate(restoredJob, storedJobId);
-          setActionError(null);
+          if (restoredJob) {
+            applyUpdate(restoredJob, storedJobId);
+            setActionError(null);
+          } else {
+            persistActiveJobId(null);
+            setActionError("上次任务已过期，已为你清理恢复记录。");
+          }
           setRestoring(false);
         }
       } catch (error) {
         if (disposed) {
-          return;
-        }
-        if (
-          error instanceof ApiRequestError &&
-          (error.status === 404 || error.status === 410)
-        ) {
-          if (pendingJobIdRef.current === storedJobId) {
-            pendingJobIdRef.current = null;
-          }
-          persistActiveJobId(null);
-          setActionError("上次任务已过期，已为你清理恢复记录。");
-          setRestoring(false);
           return;
         }
         setActionError("暂时无法恢复上次任务，正在等待服务重新连接…");
@@ -405,7 +437,7 @@ export function useTranslationJob(): TranslationJobController {
       };
 
       try {
-        const created = await createJob(file, draft, reservedJobId);
+        const created = await createJob(file, draft, reservedJobId, csrfToken);
         if (!isCurrentAttempt()) {
           return;
         }
@@ -439,30 +471,28 @@ export function useTranslationJob(): TranslationJobController {
           );
         }
 
-        // The POST response can be lost after the server has accepted the upload.
-        // Keep the same reserved ID locked until GET either finds it or proves it
-        // absent. 409 means the multipart upload is still being consumed.
+        // The POST response can be lost while the server is still before its
+        // reservation gate. A plain GET 404 cannot unlock this UUID: first
+        // linearize it through release/tombstone, then require either a job or
+        // HTTP 410 before allowing a new submission (which gets a fresh UUID).
         while (isCurrentAttempt()) {
           try {
-            const detail = await getJob(reservedJobId);
+            const detail = await resolveReservedJob(reservedJobId);
+            if (!detail) {
+              pendingJobIdRef.current = null;
+              persistActiveJobId(current);
+              setActionError(
+                `${originalMessage}；服务已安全退休原任务编号，可以重新提交。`,
+              );
+              break;
+            }
             if (detail.id !== reservedJobId) {
               throw new Error("服务返回了不一致的任务编号");
             }
             adoptReservedJob(detail);
             break;
-          } catch (recoveryError) {
+          } catch {
             if (!isCurrentAttempt()) {
-              break;
-            }
-            if (
-              recoveryError instanceof ApiRequestError &&
-              (recoveryError.status === 404 || recoveryError.status === 410)
-            ) {
-              pendingJobIdRef.current = null;
-              persistActiveJobId(current);
-              setActionError(
-                `${originalMessage}；服务已确认该任务未创建，可以重新提交。`,
-              );
               break;
             }
           }
@@ -482,7 +512,7 @@ export function useTranslationJob(): TranslationJobController {
         }
       }
     },
-    [applyUpdate, commitJob],
+    [applyUpdate, commitJob, csrfToken],
   );
 
   const cancel = useCallback(async () => {

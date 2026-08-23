@@ -1,6 +1,6 @@
 # PDF 译稿前端
 
-React + Vite + TypeScript 单页前端，用于创建 PDF 翻译任务、跟踪实时进度、取消任务和下载结果。
+React + Vite + TypeScript 前端，用于创建 PDF 翻译任务、跟踪实时进度、取消任务、下载结果，以及在 `/admin` 管理服务器端翻译渠道。
 
 ## 本地开发
 
@@ -9,7 +9,7 @@ npm install
 npm run dev
 ```
 
-默认将 `/api` 和 `/assets` 代理到 `http://127.0.0.1:7860`。可在启动前设置 `VITE_DEV_API_TARGET` 修改开发代理目标。如果 API 部署在不同域名，构建时可设置 `VITE_API_BASE_URL`。
+默认将 `/api` 代理到 `http://127.0.0.1:7860`。可在启动前设置 `VITE_DEV_API_TARGET` 修改开发代理目标。如果 API 部署在不同域名，构建时可设置 `VITE_API_BASE_URL`。
 
 ## 验证与构建
 
@@ -18,7 +18,7 @@ npm test
 npm run build
 ```
 
-生产文件输出到 `dist/`。后端需要在同一来源下提供 `/api/*` 接口，并将背景图暴露为 `/assets/translation-atmosphere.png`。
+生产文件输出到 `dist/`。后端需要在同一来源下提供 `/api/*` 接口，并将未知非 API 路径回退到 `index.html`，以便直接访问 `/admin`。
 
 ## 任务生命周期
 
@@ -41,3 +41,13 @@ npm run build
 - `POST /api/jobs/:id/heartbeat`
 - `POST /api/jobs/:id/release`
 - `GET /api/jobs/:id/files/mono|dual|glossary`
+
+管理页面使用同源 HttpOnly 会话 Cookie。API 密钥只会在保存渠道时作为请求体提交，不写入浏览器存储，也不会由服务器回显。管理端点包括：
+
+- `GET /api/admin/session`
+- `POST /api/admin/setup`
+- `POST /api/admin/login`
+- `POST /api/admin/logout`
+- `GET|POST /api/admin/providers`
+- `PUT /api/admin/providers/deepseek`
+- `PUT|DELETE /api/admin/providers/:id`

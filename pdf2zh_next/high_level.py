@@ -116,6 +116,31 @@ class UnrecoverableCleanupError(TranslationError):
 logger = logging.getLogger(__name__)
 
 
+def _scrub_translation_subprocess_environment() -> None:
+    for name in (
+        "PDF2ZH_WORKER_TOKEN",
+        "PDF2ZH_WORKER_TOKEN_FD",
+        "PDF2ZH_CONTAINER_BOOT_ID",
+    ):
+        os.environ.pop(name, None)
+
+
+def _configure_translate_subprocess_logging(
+    logger_queue: multiprocessing.Queue,
+) -> QueueHandler | None:
+    if os.getenv("PDF2ZH_PUBLIC_WORKER_MODE", "") == "1":
+        # This is a separate process from worker_api, so its logger state is an
+        # independent confidentiality boundary. BabelDOC/OpenAI exceptions can
+        # contain credentials, upstream bodies, and document text. Disable all
+        # standard logging levels and, critically, never attach QueueHandler in
+        # the public service process.
+        logging.disable(logging.CRITICAL)
+        return None
+    queue_handler = QueueHandler(logger_queue)
+    logging.basicConfig(level=logging.INFO, handlers=[queue_handler])
+    return queue_handler
+
+
 def _translate_wrapper(
     settings: SettingsModel,
     file: Path,
@@ -124,6 +149,7 @@ def _translate_wrapper(
     logger_queue: multiprocessing.Queue,
     process_group_id,
 ):
+    _scrub_translation_subprocess_environment()
     # A dedicated process group lets the parent remove BabelDOC descendants
     # (font/PDF helper processes) when cooperative cancellation times out.
     if os.name == "posix":
@@ -145,8 +171,7 @@ def _translate_wrapper(
         logging.getLogger("httpcore").setLevel(logging.WARNING)
         logging.getLogger("peewee").setLevel(logging.WARNING)
 
-        queue_handler = QueueHandler(logger_queue)
-        logging.basicConfig(level=logging.INFO, handlers=[queue_handler])
+        queue_handler = _configure_translate_subprocess_logging(logger_queue)
 
         # Workaround for loky spawning powershell.exe on Windows.
         # loky queries physical CPU cores via powershell.exe without

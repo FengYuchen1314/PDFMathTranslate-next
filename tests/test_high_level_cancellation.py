@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import os
 import queue
 import threading
 from pathlib import Path
@@ -120,6 +122,44 @@ class FakeContext:
         assert target is high_level._translate_wrapper
         assert len(args) == 6
         return self.process
+
+
+def test_public_translation_subprocess_never_installs_log_queue_handler(
+    monkeypatch,
+):
+    class ObservedQueue:
+        def __init__(self):
+            self.items = []
+
+        def put(self, item):
+            self.items.append(item)
+
+    observed_queue = ObservedQueue()
+    previous_disable_level = logging.root.manager.disable
+    monkeypatch.setenv("PDF2ZH_PUBLIC_WORKER_MODE", "1")
+    monkeypatch.setenv("PDF2ZH_WORKER_TOKEN", "coordinator-secret")
+    monkeypatch.setenv("PDF2ZH_WORKER_TOKEN_FD", "123")
+    monkeypatch.setenv("PDF2ZH_CONTAINER_BOOT_ID", "container-identity")
+    monkeypatch.setattr(
+        high_level,
+        "QueueHandler",
+        lambda _queue: pytest.fail("public subprocess attached QueueHandler"),
+    )
+    try:
+        high_level._scrub_translation_subprocess_environment()
+        handler = high_level._configure_translate_subprocess_logging(observed_queue)
+        logging.getLogger("malicious-upstream").critical(
+            "secret API key and document body"
+        )
+
+        assert handler is None
+        assert logging.root.manager.disable >= logging.CRITICAL
+        assert observed_queue.items == []
+        assert "PDF2ZH_WORKER_TOKEN" not in os.environ
+        assert "PDF2ZH_WORKER_TOKEN_FD" not in os.environ
+        assert "PDF2ZH_CONTAINER_BOOT_ID" not in os.environ
+    finally:
+        logging.disable(previous_disable_level)
 
 
 def test_finish_is_published_only_after_worker_and_ipc_cleanup(monkeypatch):

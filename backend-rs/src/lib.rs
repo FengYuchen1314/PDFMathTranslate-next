@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::env;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -27,18 +29,22 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tower_http::compression::CompressionLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use zeroize::Zeroizing;
+
+mod admin;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -47,6 +53,10 @@ const LANGUAGE_CODES: &[&str] = &[
 ];
 const MAX_FIELD_BYTES: usize = 1024;
 const MAX_INTERNAL_EVENT_BYTES: usize = 256 * 1024;
+const SMALL_API_BODY_BYTES: usize = 64 * 1024;
+const MAX_PDF_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_GLOSSARY_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TOTAL_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const PRESTART_TOMBSTONE_RETENTION: Duration = Duration::from_secs(15 * 60);
 const PRESTART_TOMBSTONE_CAPACITY: usize = 4096;
 const DEEPSEEK_MODEL_FLASH: &str = "deepseek-v4-flash";
@@ -99,9 +109,11 @@ impl AppConfig {
         if concurrency != 1 {
             return Err("PDF2ZH_CONCURRENCY must be exactly one for safe worker recycling".into());
         }
-        let max_active_jobs = env_parse("PDF2ZH_MAX_ACTIVE_JOBS", 8_usize)?;
-        if max_active_jobs == 0 {
-            return Err("PDF2ZH_MAX_ACTIVE_JOBS must be at least one".into());
+        let max_active_jobs = env_parse("PDF2ZH_MAX_ACTIVE_JOBS", 1_usize)?;
+        if max_active_jobs != 1 {
+            return Err(
+                "PDF2ZH_MAX_ACTIVE_JOBS must be exactly one for per-job worker isolation".into(),
+            );
         }
         let lease_timeout = Duration::from_secs(env_parse("PDF2ZH_LEASE_SECONDS", 180_u64)?);
         let release_grace = Duration::from_secs(env_parse("PDF2ZH_RELEASE_GRACE_SECONDS", 15_u64)?);
@@ -181,6 +193,8 @@ pub enum TranslationProvider {
     Google,
     #[serde(rename = "deepseek")]
     DeepSeek,
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -222,6 +236,16 @@ pub struct JobOptions {
     pub deepseek_thinking_mode: Option<DeepSeekThinkingMode>,
     #[serde(default)]
     pub deepseek_reasoning_effort: Option<DeepSeekReasoningEffort>,
+    #[serde(default = "default_provider_id")]
+    pub provider_id: String,
+    #[serde(default)]
+    pub provider_revision: Option<i64>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+}
+
+fn default_provider_id() -> String {
+    "google".to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -271,6 +295,7 @@ struct JobEntry {
     admission_permit: StdMutex<Option<OwnedSemaphorePermit>>,
     lease: Mutex<JobLease>,
     job_dir: PathBuf,
+    runtime_provider: StdMutex<Option<admin::RuntimeProvider>>,
 }
 
 struct JobLease {
@@ -364,13 +389,14 @@ impl Drop for PendingUploadGuard {
 impl JobEntry {
     #[cfg(test)]
     fn new(snapshot: JobSnapshot, job_dir: PathBuf) -> Arc<Self> {
-        Self::new_with_admission(snapshot, job_dir, None)
+        Self::new_with_runtime(snapshot, job_dir, None, None)
     }
 
-    fn new_with_admission(
+    fn new_with_runtime(
         snapshot: JobSnapshot,
         job_dir: PathBuf,
         admission_permit: Option<OwnedSemaphorePermit>,
+        runtime_provider: Option<admin::RuntimeProvider>,
     ) -> Arc<Self> {
         let (sender, _) = broadcast::channel(64);
         Arc::new(Self {
@@ -385,6 +411,7 @@ impl JobEntry {
                 released_at: None,
             }),
             job_dir,
+            runtime_provider: StdMutex::new(runtime_provider),
         })
     }
 }
@@ -411,6 +438,8 @@ impl Persistence {
         let options = SqliteConnectOptions::new()
             .filename(database_path)
             .create_if_missing(true)
+            .foreign_keys(true)
+            .pragma("secure_delete", "ON")
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
@@ -497,7 +526,23 @@ impl Persistence {
                 }
             };
             match serde_json::from_str::<JobSnapshot>(&json) {
-                Ok(snapshot) if snapshot.id.to_string() == row_id => snapshots.push(snapshot),
+                Ok(mut snapshot) if snapshot.id.to_string() == row_id => {
+                    if snapshot.options.provider_id == "google"
+                        && snapshot.options.provider == TranslationProvider::DeepSeek
+                    {
+                        snapshot.options.provider_id = "deepseek".to_owned();
+                    }
+                    if snapshot.options.model_id.is_none() {
+                        snapshot.options.model_id = snapshot.options.deepseek_model.map(|model| {
+                            match model {
+                                DeepSeekModel::V4Flash => DEEPSEEK_MODEL_FLASH,
+                                DeepSeekModel::V4Pro => DEEPSEEK_MODEL_PRO,
+                            }
+                            .to_owned()
+                        });
+                    }
+                    snapshots.push(snapshot);
+                }
                 Ok(snapshot) => {
                     warn!(
                         database_id = %row_id,
@@ -662,9 +707,10 @@ struct AppStateInner {
     shutdown: CancellationToken,
     runner_gate: Mutex<()>,
     pending_uploads: StdMutex<HashMap<Uuid, Arc<PendingUploadState>>>,
-    worker_epoch: RwLock<Option<String>>,
+    worker_identity: RwLock<Option<WorkerIdentity>>,
     client: Client,
     persistence: Persistence,
+    admin: admin::AdminService,
 }
 
 #[derive(Clone)]
@@ -672,12 +718,21 @@ pub struct AppState(Arc<AppStateInner>);
 
 impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self, BoxError> {
+        if config.concurrency != 1 || config.max_active_jobs != 1 {
+            return Err("job concurrency and active admission must both be exactly one".into());
+        }
         fs::create_dir_all(&config.data_root).await?;
+        let artifact_root = config.state_root.join("artifacts");
+        let upload_root = config.state_root.join("uploads");
+        fs::create_dir_all(&artifact_root).await?;
+        fs::create_dir_all(&upload_root).await?;
+        #[cfg(unix)]
+        fs::set_permissions(&artifact_root, std::fs::Permissions::from_mode(0o700)).await?;
+        #[cfg(unix)]
+        fs::set_permissions(&upload_root, std::fs::Permissions::from_mode(0o700)).await?;
         let persistence = Persistence::open(&config.state_root).await?;
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .pool_idle_timeout(Duration::from_secs(60))
-            .build()?;
+        let admin = admin::AdminService::new(persistence.pool.clone(), config.port).await?;
+        let client = build_worker_client()?;
         let state = Self(Arc::new(AppStateInner {
             permits: Arc::new(Semaphore::new(config.concurrency)),
             admission: Arc::new(Semaphore::new(config.max_active_jobs)),
@@ -685,10 +740,11 @@ impl AppState {
             shutdown: CancellationToken::new(),
             runner_gate: Mutex::new(()),
             pending_uploads: StdMutex::new(HashMap::new()),
-            worker_epoch: RwLock::new(None),
+            worker_identity: RwLock::new(None),
             jobs: RwLock::new(HashMap::new()),
             client,
             persistence,
+            admin,
             config,
         }));
         state.wait_for_initial_worker_epoch().await;
@@ -700,11 +756,11 @@ impl AppState {
         let started_at = Instant::now();
         loop {
             if let Some(health) = fetch_worker_health(self).await
-                && health.status == "ok"
-                && health.supports_provider("google")
+                && health.is_ready(self.0.config.concurrency)
             {
-                *self.0.worker_epoch.write().await = Some(health.epoch.clone());
-                info!(epoch = %health.epoch, "connected to Python worker epoch");
+                let identity = health.identity();
+                *self.0.worker_identity.write().await = Some(identity.clone());
+                info!(epoch = %identity.epoch, container_boot_id = %identity.container_boot_id, "connected to Python worker epoch");
                 return;
             }
             if started_at.elapsed() > self.0.config.worker_recycle_timeout {
@@ -720,11 +776,13 @@ impl AppState {
     async fn restore_jobs(&self) -> Result<(), BoxError> {
         let persisted = self.0.persistence.load().await?;
         let mut interrupted = Vec::new();
+        let mut succeeded = Vec::new();
         {
             let mut jobs = self.0.jobs.write().await;
             for snapshot in persisted.snapshots {
                 let id = snapshot.id;
                 let was_cancelling = snapshot.status == JobStatus::Cancelling;
+                let was_succeeded = snapshot.status == JobStatus::Succeeded;
                 let active = snapshot.status.is_active();
                 let job_dir = self.0.config.data_root.join(snapshot.id.to_string());
                 let admission_permit = if active {
@@ -735,11 +793,52 @@ impl AppState {
                 if active && admission_permit.is_none() {
                     warn!(%id, "restored active jobs exceeded the configured admission limit");
                 }
-                let entry = JobEntry::new_with_admission(snapshot, job_dir, admission_permit);
+                // Active jobs are always reconciled to a terminal cancellation
+                // after a Rust process restart. Provider credentials therefore
+                // remain memory-only and are deliberately never rehydrated from
+                // a historical database revision.
+                let runtime_provider = None;
+                let entry = JobEntry::new_with_runtime(
+                    snapshot,
+                    job_dir,
+                    admission_permit,
+                    runtime_provider,
+                );
                 if active {
                     interrupted.push((entry.clone(), was_cancelling));
                 }
+                if was_succeeded {
+                    succeeded.push(entry.clone());
+                }
                 jobs.insert(id, entry);
+            }
+        }
+        for entry in succeeded {
+            let snapshot = entry.snapshot.read().await.clone();
+            let id = snapshot.id;
+            if published_artifacts_are_valid(self, id, &snapshot.files).await {
+                if let Err(error) = remove_worker_job_files(self, id).await {
+                    warn!(%id, %error, "failed to clear a restored succeeded worker directory");
+                }
+                continue;
+            }
+            match confirm_materialized_outputs(self, &entry, id).await {
+                Ok(files) => {
+                    update_job(self, &entry, |snapshot| snapshot.files = files).await;
+                }
+                Err(error) => {
+                    warn!(%id, %error, "restored succeeded job had no safe published artifacts");
+                    update_job(self, &entry, |snapshot| {
+                        snapshot.status = JobStatus::Failed;
+                        snapshot.stage = "翻译失败".to_owned();
+                        snapshot.message = "任务未完成，可以重新提交".to_owned();
+                        snapshot.error = Some("翻译服务暂时无法完成任务，请稍后重试".to_owned());
+                        snapshot.files = JobFiles::default();
+                        snapshot.finished_at = Some(Utc::now());
+                    })
+                    .await;
+                    safe_remove_job_dir(self, id).await;
+                }
             }
         }
         for (entry, was_cancelling) in interrupted {
@@ -757,6 +856,8 @@ impl AppState {
             )
             .await;
             cleanup_failed_job(self, &entry, id).await;
+            let _ = force_recycle_worker(self, id).await;
+            release_job_admission(&entry);
         }
         for id in persisted.corrupt_ids {
             if self.0.jobs.read().await.contains_key(&id) {
@@ -766,13 +867,16 @@ impl AppState {
             warn!(%id, "cancelling the worker id recovered from a corrupt state row");
             let _ = cancel_worker_until_terminal(self, id).await;
             safe_remove_job_dir(self, id).await;
+            let _ = force_recycle_worker(self, id).await;
         }
-        if !drain_worker_until_idle(self).await {
-            warn!("startup drain exceeded its deadline; recycling the Python worker");
-            let _ = force_recycle_worker(self, Uuid::nil()).await;
-        }
+        // A web restart cannot prove that a process-group escape did not
+        // survive in the reusable worker container. Always begin admission on
+        // a newly observed epoch; the recycle also drains the replacement and
+        // scrubs every shared-volume entry, including non-UUID names/symlinks.
+        let _ = force_recycle_worker(self, Uuid::nil()).await;
         cleanup_orphan_job_dirs(self).await;
-        resume_worker(self).await?;
+        cleanup_orphan_artifact_dirs(self).await;
+        cleanup_orphan_private_uploads(self).await;
         Ok(())
     }
 
@@ -820,6 +924,18 @@ impl AppState {
     }
 }
 
+fn build_worker_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        // Internal worker requests may contain provider credentials. Never
+        // inherit HTTP(S)_PROXY and never follow a redirect to another
+        // authority with that JSON body.
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .pool_idle_timeout(Duration::from_secs(60))
+        .build()
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
@@ -831,6 +947,10 @@ enum ApiError {
     BadRequest(String),
     #[error("任务不存在")]
     NotFound,
+    #[error("使用付费翻译渠道需要管理员登录")]
+    Unauthorized,
+    #[error("管理员会话或 CSRF 校验失败")]
+    Forbidden,
     #[error("任务编号已释放，请使用新的任务编号")]
     Gone,
     #[error("翻译服务暂时不可用")]
@@ -850,6 +970,8 @@ impl IntoResponse for ApiError {
         let status = match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Gone => StatusCode::GONE,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Conflict(_) => StatusCode::CONFLICT,
@@ -857,13 +979,17 @@ impl IntoResponse for ApiError {
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (
+        let mut response = (
             status,
             Json(ErrorBody {
                 error: self.to_string(),
             }),
         )
-            .into_response()
+            .into_response();
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
     }
 }
 
@@ -876,6 +1002,12 @@ struct HealthResponse {
     active_jobs: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkerIdentity {
+    epoch: String,
+    container_boot_id: String,
+}
+
 #[derive(Deserialize)]
 struct WorkerHealth {
     status: String,
@@ -886,9 +1018,18 @@ struct WorkerHealth {
     active_jobs: usize,
     accepting_jobs: bool,
     epoch: String,
+    container_boot_id: String,
+    max_active_jobs: usize,
 }
 
 impl WorkerHealth {
+    fn identity(&self) -> WorkerIdentity {
+        WorkerIdentity {
+            epoch: self.epoch.clone(),
+            container_boot_id: self.container_boot_id.clone(),
+        }
+    }
+
     fn supports_provider(&self, provider: &str) -> bool {
         self.provider.as_deref() == Some(provider)
             || self.providers.iter().any(|candidate| candidate == provider)
@@ -899,6 +1040,21 @@ impl WorkerHealth {
             && self.supports_provider("google")
             && self.accepting_jobs
             && self.active_jobs <= concurrency
+            && self.max_active_jobs == 1
+            && !self.epoch.is_empty()
+            && !self.container_boot_id.is_empty()
+    }
+
+    fn supports_translation_provider(&self, provider: TranslationProvider) -> bool {
+        match provider {
+            TranslationProvider::Google => true,
+            TranslationProvider::DeepSeek => self.supports_provider("deepseek"),
+            TranslationProvider::OpenAiCompatible => self.supports_provider("openai_compatible"),
+        }
+    }
+
+    fn is_replacement_for(&self, previous: &WorkerIdentity) -> bool {
+        self.epoch != previous.epoch && self.container_boot_id != previous.container_boot_id
     }
 }
 
@@ -909,29 +1065,32 @@ struct PublicConfig {
     providers: Vec<ProviderDescriptor>,
     languages: Vec<Language>,
     max_upload_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    csrf_token: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderDescriptor {
-    id: &'static str,
-    name: &'static str,
+    id: String,
+    kind: String,
+    name: String,
     available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    unavailable_reason: Option<&'static str>,
+    unavailable_reason: Option<String>,
     models: Vec<ProviderModelDescriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    default_model: Option<&'static str>,
-    thinking_modes: Vec<&'static str>,
-    reasoning_efforts: Vec<&'static str>,
+    default_model: Option<String>,
+    thinking_modes: Vec<String>,
+    reasoning_efforts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    default_reasoning_effort: Option<&'static str>,
+    default_reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ProviderModelDescriptor {
-    id: &'static str,
-    name: &'static str,
+    id: String,
+    name: String,
 }
 
 #[derive(Serialize)]
@@ -948,10 +1107,18 @@ pub fn build_router(state: AppState) -> Router {
     let static_files =
         ServeDir::new(&state.0.config.frontend_dir).fallback(ServeFile::new(index_path));
 
-    Router::new()
+    // Keep the exceptional multipart allowance scoped to the one upload
+    // endpoint. In particular, an outer DefaultBodyLimit would overwrite the
+    // admin router's JSON limit and let authentication/configuration requests
+    // consume the full PDF allowance.
+    let upload_routes = Router::new()
+        .route("/api/jobs", post(create_job))
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(RequestBodyLimitLayer::new(body_limit));
+    let bounded_api_routes = Router::new()
+        .nest("/api/admin", admin::router())
         .route("/api/health", get(health))
         .route("/api/config", get(public_config))
-        .route("/api/jobs", post(create_job))
         .route("/api/jobs/{id}", get(get_job).delete(dispose_job))
         .route("/api/jobs/{id}/events", get(job_events))
         .route("/api/jobs/{id}/cancel", post(cancel_job))
@@ -960,8 +1127,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs/{id}/files/{kind}", get(download_file))
         .route("/api", any(api_not_found))
         .route("/api/{*path}", any(api_not_found))
+        .layer(DefaultBodyLimit::max(SMALL_API_BODY_BYTES))
+        .layer(RequestBodyLimitLayer::new(SMALL_API_BODY_BYTES));
+
+    Router::new()
+        .merge(upload_routes)
+        .merge(bounded_api_routes)
         .fallback_service(static_files)
-        .layer(DefaultBodyLimit::max(body_limit))
         .layer(CompressionLayer::new())
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("x-content-type-options"),
@@ -970,6 +1142,20 @@ pub fn build_router(state: AppState) -> Router {
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("referrer-policy"),
             HeaderValue::from_static("same-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(
+                "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+            ),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -1013,14 +1199,26 @@ async fn worker_is_ready_for_provider(state: &AppState, provider: TranslationPro
         return false;
     };
     let ready = health.is_ready(state.0.config.concurrency)
-        && match provider {
-            TranslationProvider::Google => true,
-            TranslationProvider::DeepSeek => health.supports_provider("deepseek"),
-        };
+        && health.supports_translation_provider(provider);
     if ready {
-        *state.0.worker_epoch.write().await = Some(health.epoch);
+        *state.0.worker_identity.write().await = Some(health.identity());
     }
     ready
+}
+
+async fn ready_worker_identity_for_provider(
+    state: &AppState,
+    provider: TranslationProvider,
+) -> Option<WorkerIdentity> {
+    let health = fetch_worker_health(state).await?;
+    if !health.is_ready(state.0.config.concurrency)
+        || !health.supports_translation_provider(provider)
+    {
+        return None;
+    }
+    let identity = health.identity();
+    *state.0.worker_identity.write().await = Some(identity.clone());
+    Some(identity)
 }
 
 async fn fetch_worker_health(state: &AppState) -> Option<WorkerHealth> {
@@ -1039,114 +1237,146 @@ async fn fetch_worker_health(state: &AppState) -> Option<WorkerHealth> {
     response.json::<WorkerHealth>().await.ok()
 }
 
-async fn public_config(State(state): State<AppState>) -> Json<PublicConfig> {
+async fn public_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Json<PublicConfig>), ApiError> {
     let worker_health = fetch_worker_health(&state).await;
-    Json(PublicConfig {
-        provider: "google",
-        providers: public_provider_descriptors(worker_health.as_ref(), state.0.config.concurrency),
-        max_upload_bytes: state.0.config.max_upload_bytes,
-        languages: vec![
-            Language {
-                code: "auto",
-                name: "自动检测",
-            },
-            Language {
-                code: "en",
-                name: "English",
-            },
-            Language {
-                code: "zh",
-                name: "简体中文",
-            },
-            Language {
-                code: "zh-TW",
-                name: "繁體中文",
-            },
-            Language {
-                code: "ja",
-                name: "日本語",
-            },
-            Language {
-                code: "ko",
-                name: "한국어",
-            },
-            Language {
-                code: "fr",
-                name: "Français",
-            },
-            Language {
-                code: "de",
-                name: "Deutsch",
-            },
-            Language {
-                code: "es",
-                name: "Español",
-            },
-            Language {
-                code: "ru",
-                name: "Русский",
-            },
-            Language {
-                code: "it",
-                name: "Italiano",
-            },
-            Language {
-                code: "pt",
-                name: "Português",
-            },
-        ],
-    })
+    let admin_session = state.0.admin.config_session(&headers).await;
+    let configured = if admin_session.is_some() {
+        state
+            .0
+            .admin
+            .public_providers()
+            .await
+            .map_err(internal_error)?
+    } else {
+        Vec::new()
+    };
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((
+        response_headers,
+        Json(PublicConfig {
+            provider: "google",
+            providers: public_provider_descriptors(worker_health.as_ref(), configured),
+            max_upload_bytes: state.0.config.max_upload_bytes,
+            csrf_token: admin_session.and_then(|session| session.csrf_token),
+            languages: vec![
+                Language {
+                    code: "auto",
+                    name: "自动检测",
+                },
+                Language {
+                    code: "en",
+                    name: "English",
+                },
+                Language {
+                    code: "zh",
+                    name: "简体中文",
+                },
+                Language {
+                    code: "zh-TW",
+                    name: "繁體中文",
+                },
+                Language {
+                    code: "ja",
+                    name: "日本語",
+                },
+                Language {
+                    code: "ko",
+                    name: "한국어",
+                },
+                Language {
+                    code: "fr",
+                    name: "Français",
+                },
+                Language {
+                    code: "de",
+                    name: "Deutsch",
+                },
+                Language {
+                    code: "es",
+                    name: "Español",
+                },
+                Language {
+                    code: "ru",
+                    name: "Русский",
+                },
+                Language {
+                    code: "it",
+                    name: "Italiano",
+                },
+                Language {
+                    code: "pt",
+                    name: "Português",
+                },
+            ],
+        }),
+    ))
 }
 
 fn public_provider_descriptors(
     health: Option<&WorkerHealth>,
-    _concurrency: usize,
+    configured: Vec<admin::PublicProviderConfig>,
 ) -> Vec<ProviderDescriptor> {
     // Provider availability describes configuration/capability, not a
     // transient drain or a currently occupied worker slot. Admission and
     // readiness are checked again when the job is created.
     let google_available =
         health.is_some_and(|health| health.status == "ok" && health.supports_provider("google"));
-    let deepseek_available =
-        health.is_some_and(|health| health.status == "ok" && health.supports_provider("deepseek"));
     let worker_available = health.is_some_and(|health| health.status == "ok");
-    vec![
+    let mut providers = vec![ProviderDescriptor {
+        id: "google".to_owned(),
+        kind: "google".to_owned(),
+        name: "Google".to_owned(),
+        available: google_available,
+        unavailable_reason: (!google_available).then(|| "worker_unavailable".to_owned()),
+        models: Vec::new(),
+        default_model: None,
+        thinking_modes: Vec::new(),
+        reasoning_efforts: Vec::new(),
+        default_reasoning_effort: None,
+    }];
+    providers.extend(configured.into_iter().map(|provider| {
+        let worker_capable = health.is_some_and(|health| {
+            health.status == "ok"
+                && health.supports_provider(if provider.kind == "deepseek" {
+                    "deepseek"
+                } else {
+                    "openai_compatible"
+                })
+        });
+        let available = provider.available && worker_capable;
         ProviderDescriptor {
-            id: "google",
-            name: "Google",
-            available: google_available,
-            unavailable_reason: (!google_available).then_some("worker_unavailable"),
-            models: Vec::new(),
-            default_model: None,
-            thinking_modes: Vec::new(),
-            reasoning_efforts: Vec::new(),
-            default_reasoning_effort: None,
-        },
-        ProviderDescriptor {
-            id: "deepseek",
-            name: "DeepSeek",
-            available: deepseek_available,
-            unavailable_reason: (!deepseek_available).then_some(if worker_available {
-                "not_configured"
-            } else {
-                "worker_unavailable"
+            id: provider.id,
+            kind: provider.kind,
+            name: provider.name,
+            available,
+            unavailable_reason: (!available).then(|| {
+                if !worker_available || !worker_capable {
+                    "worker_unavailable".to_owned()
+                } else {
+                    provider
+                        .unavailable_reason
+                        .unwrap_or_else(|| "not_configured".to_owned())
+                }
             }),
-            models: vec![
-                ProviderModelDescriptor {
-                    id: DEEPSEEK_MODEL_FLASH,
-                    name: "DeepSeek V4 Flash",
-                },
-                ProviderModelDescriptor {
-                    id: DEEPSEEK_MODEL_PRO,
-                    name: "DeepSeek V4 Pro",
-                },
-            ],
-            default_model: Some(DEEPSEEK_MODEL_FLASH),
-            thinking_modes: vec!["enabled", "disabled"],
-            reasoning_efforts: vec!["low", "high", "max"],
-            default_reasoning_effort: Some("high"),
-        },
-    ]
+            models: provider
+                .models
+                .into_iter()
+                .map(|model| ProviderModelDescriptor {
+                    id: model.id,
+                    name: model.name,
+                })
+                .collect(),
+            default_model: provider.default_model,
+            thinking_modes: provider.thinking_modes,
+            reasoning_efforts: provider.reasoning_efforts,
+            default_reasoning_effort: provider.default_reasoning_effort,
+        }
+    }));
+    providers
 }
 
 #[derive(Default)]
@@ -1161,6 +1391,10 @@ struct PendingUpload {
     deepseek_model: Option<String>,
     deepseek_thinking_mode: Option<String>,
     deepseek_reasoning_effort: Option<String>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    thinking_mode: Option<String>,
+    reasoning_effort: Option<String>,
     saw_file: bool,
 }
 
@@ -1246,15 +1480,19 @@ async fn create_job(
         }
     }
     drop(reservation_guard);
-    let job_dir = state.0.config.data_root.join(id.to_string());
-    if let Err(error) = fs::create_dir(&job_dir).await {
+    let private_upload_dir = state
+        .0
+        .config
+        .state_root
+        .join("uploads")
+        .join(id.to_string());
+    if let Err(error) = fs::create_dir(&private_upload_dir).await {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             let existing = state.0.jobs.read().await.get(&id).cloned();
             if let Some(entry) = existing {
                 pending_guard.commit();
                 return Ok((StatusCode::OK, Json(entry.snapshot.read().await.clone())));
             }
-            pending_guard.commit();
             return Err(ApiError::Conflict("任务编号已被占用".to_owned()));
         }
         return Err(internal_error(error));
@@ -1262,7 +1500,7 @@ async fn create_job(
     pending_guard.mark_created_dir();
     let upload_result = tokio::time::timeout(
         state.0.config.upload_timeout,
-        receive_upload(&state, &job_dir, &mut multipart, &upload_state.cancellation),
+        receive_upload(&state, id, &mut multipart, &upload_state.cancellation),
     )
     .await
     .map_err(|_| ApiError::RequestTimeout)
@@ -1275,25 +1513,78 @@ async fn create_job(
         }
     };
 
-    let options = match validate_upload_options(&pending) {
+    let mut options = match validate_upload_options(&pending) {
         Ok(options) => options,
         Err(error) => {
             safe_remove_job_dir(&state, id).await;
             return Err(error);
         }
     };
+    if options.provider != TranslationProvider::Google {
+        state
+            .0
+            .admin
+            .authorize_paid_job(&headers)
+            .await
+            .map_err(|error| match error {
+                admin::PaidJobAuthorizationError::Unauthorized => ApiError::Unauthorized,
+                admin::PaidJobAuthorizationError::Forbidden => ApiError::Forbidden,
+                admin::PaidJobAuthorizationError::Internal => ApiError::Internal,
+            })?;
+    }
+    let runtime_provider = if options.provider == TranslationProvider::Google {
+        None
+    } else {
+        let model_id = options
+            .model_id
+            .as_deref()
+            .ok_or_else(|| ApiError::BadRequest("必须指定模型".to_owned()))?;
+        let runtime = match state
+            .0
+            .admin
+            .resolve_runtime(id, &options.provider_id, model_id)
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(message) => {
+                safe_remove_job_dir(&state, id).await;
+                return Err(ApiError::BadRequest(message));
+            }
+        };
+        options.provider = match runtime.kind.as_str() {
+            "deepseek" => TranslationProvider::DeepSeek,
+            "openai_compatible" => TranslationProvider::OpenAiCompatible,
+            _ => {
+                safe_remove_job_dir(&state, id).await;
+                return Err(ApiError::Internal);
+            }
+        };
+        options.provider_revision = Some(runtime.revision);
+        Some(runtime)
+    };
     if !worker_is_ready_for_provider(&state, options.provider).await {
         safe_remove_job_dir(&state, id).await;
         return Err(ApiError::Unavailable);
+    }
+    if let Err(error) = publish_private_upload_to_worker(&state, id).await {
+        safe_remove_job_dir(&state, id).await;
+        return Err(error);
+    }
+    if let Err(error) = remove_private_upload(&state, id).await {
+        error!(%id, %error, "failed to erase the private upload after worker publication");
+        safe_remove_job_dir(&state, id).await;
+        return Err(ApiError::Internal);
     }
     let filename = pending
         .filename
         .unwrap_or_else(|| "document.pdf".to_owned());
     let snapshot = JobSnapshot::queued(id, filename, options);
-    let entry = JobEntry::new_with_admission(
+    let job_dir = state.0.config.data_root.join(id.to_string());
+    let entry = JobEntry::new_with_runtime(
         snapshot.clone(),
         job_dir,
         Some(pending_guard.take_admission_permit()),
+        runtime_provider,
     );
     let runner_guard = state.0.runner_gate.lock().await;
     if state.0.shutdown.is_cancelled() || upload_state.cancellation.is_cancelled() {
@@ -1353,9 +1644,242 @@ fn parse_requested_job_id(headers: &HeaderMap) -> Result<Option<Uuid>, ApiError>
     Ok(Some(id))
 }
 
+struct SecureUploadTarget {
+    file: Option<File>,
+    #[cfg(target_os = "linux")]
+    job_dir_fd: Option<rustix::fd::OwnedFd>,
+    #[cfg(target_os = "linux")]
+    staging_name: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SecureUploadTarget {
+    fn drop(&mut self) {
+        let (Some(job_dir_fd), Some(staging_name)) =
+            (self.job_dir_fd.as_ref(), self.staging_name.as_deref())
+        else {
+            return;
+        };
+        let _ = rustix::fs::unlinkat(job_dir_fd, staging_name, rustix::fs::AtFlags::empty());
+        let _ = rustix::fs::fsync(job_dir_fd);
+    }
+}
+
+impl SecureUploadTarget {
+    async fn publish(mut self) -> Result<(), ApiError> {
+        #[cfg(target_os = "linux")]
+        {
+            let file = self.file.take().ok_or(ApiError::Internal)?;
+            let job_dir_fd = self.job_dir_fd.take().ok_or(ApiError::Internal)?;
+            let staging_name = self.staging_name.take().ok_or(ApiError::Internal)?;
+            let file = file.into_std().await;
+            tokio::task::spawn_blocking(move || {
+                publish_secure_upload_file(file, job_dir_fd, staging_name)
+            })
+            .await
+            .map_err(internal_error)?
+            .map_err(internal_error)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = self;
+            Err(ApiError::Internal)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn create_secure_upload_target(
+    state: &AppState,
+    id: Uuid,
+) -> Result<SecureUploadTarget, ApiError> {
+    let upload_root = state.0.config.state_root.join("uploads");
+    let (file, job_dir_fd, staging_name) =
+        tokio::task::spawn_blocking(move || create_secure_upload_file(&upload_root, id))
+            .await
+            .map_err(internal_error)?
+            .map_err(internal_error)?;
+    Ok(SecureUploadTarget {
+        file: Some(File::from_std(file)),
+        job_dir_fd: Some(job_dir_fd),
+        staging_name: Some(staging_name),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn create_secure_upload_file(
+    upload_root: &Path,
+    id: Uuid,
+) -> Result<(std::fs::File, rustix::fd::OwnedFd, String), BoxError> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+
+    let root_fd = rustix::fs::open(
+        upload_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    let resolve = ResolveFlags::BENEATH
+        | ResolveFlags::NO_SYMLINKS
+        | ResolveFlags::NO_MAGICLINKS
+        | ResolveFlags::NO_XDEV;
+    let job_dir_fd = rustix::fs::openat2(
+        &root_fd,
+        id.to_string(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        resolve,
+    )?;
+    let (file, staging_name) = create_secure_staging_file(&job_dir_fd, resolve)?;
+    Ok((file, job_dir_fd, staging_name))
+}
+
+#[cfg(target_os = "linux")]
+fn create_secure_staging_file(
+    job_dir_fd: &rustix::fd::OwnedFd,
+    resolve: rustix::fs::ResolveFlags,
+) -> Result<(std::fs::File, String), BoxError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let staging_name = format!(".input.{}.tmp", Uuid::new_v4());
+    let upload_fd = rustix::fs::openat2(
+        job_dir_fd,
+        staging_name.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+        resolve,
+    )?;
+    Ok((std::fs::File::from(upload_fd), staging_name))
+}
+
+#[cfg(target_os = "linux")]
+fn publish_secure_upload_file(
+    file: std::fs::File,
+    job_dir_fd: rustix::fd::OwnedFd,
+    staging_name: String,
+) -> Result<(), BoxError> {
+    use rustix::fs::RenameFlags;
+
+    let mut renamed = false;
+    let result = (|| -> Result<(), BoxError> {
+        file.sync_all()?;
+        rustix::fs::renameat_with(
+            &job_dir_fd,
+            staging_name.as_str(),
+            &job_dir_fd,
+            "input.pdf",
+            RenameFlags::NOREPLACE,
+        )?;
+        renamed = true;
+        rustix::fs::fsync(&job_dir_fd)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let cleanup_name = if renamed {
+            "input.pdf"
+        } else {
+            staging_name.as_str()
+        };
+        let _ = rustix::fs::unlinkat(&job_dir_fd, cleanup_name, rustix::fs::AtFlags::empty());
+        let _ = rustix::fs::fsync(&job_dir_fd);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+async fn publish_private_upload_to_worker(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    let upload_root = state.0.config.state_root.join("uploads");
+    let data_root = state.0.config.data_root.clone();
+    tokio::task::spawn_blocking(move || materialize_worker_input(&upload_root, &data_root, id))
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)
+}
+
+#[cfg(target_os = "linux")]
+fn materialize_worker_input(
+    upload_root: &Path,
+    data_root: &Path,
+    id: Uuid,
+) -> Result<(), BoxError> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+
+    let root_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let resolve = ResolveFlags::BENEATH
+        | ResolveFlags::NO_SYMLINKS
+        | ResolveFlags::NO_MAGICLINKS
+        | ResolveFlags::NO_XDEV;
+    let upload_root_fd = rustix::fs::open(upload_root, root_flags, Mode::empty())?;
+    let source_fd = rustix::fs::openat2(
+        &upload_root_fd,
+        format!("{id}/input.pdf"),
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+        resolve,
+    )?;
+    let mut source = std::fs::File::from(source_fd);
+    let metadata = source.metadata()?;
+    if !metadata.is_file() || metadata.len() < 5 {
+        return Err("private upload is not a non-empty regular PDF".into());
+    }
+    let mut prefix = [0_u8; 5];
+    std::io::Read::read_exact(&mut source, &mut prefix)?;
+    if &prefix != b"%PDF-" {
+        return Err("private upload failed PDF magic validation".into());
+    }
+    std::io::Seek::rewind(&mut source)?;
+
+    let data_root_fd = rustix::fs::open(data_root, root_flags, Mode::empty())?;
+    rustix::fs::mkdirat(&data_root_fd, id.to_string(), Mode::RWXU)?;
+    let job_dir_fd = rustix::fs::openat2(
+        &data_root_fd,
+        id.to_string(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        resolve,
+    )?;
+    let (mut destination, staging_name) = create_secure_staging_file(&job_dir_fd, resolve)?;
+    let copy_result = (|| -> Result<(), BoxError> {
+        let mut limited = std::io::Read::take(&mut source, metadata.len());
+        let copied = std::io::copy(&mut limited, &mut destination)?;
+        if copied != metadata.len() {
+            return Err("private upload changed while being published".into());
+        }
+        std::io::Write::flush(&mut destination)?;
+        destination.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        let _ = rustix::fs::unlinkat(
+            &job_dir_fd,
+            staging_name.as_str(),
+            rustix::fs::AtFlags::empty(),
+        );
+        let _ = rustix::fs::fsync(&job_dir_fd);
+        return Err(error);
+    }
+    publish_secure_upload_file(destination, job_dir_fd, staging_name)?;
+    rustix::fs::fsync(&data_root_fd)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn publish_private_upload_to_worker(_state: &AppState, _id: Uuid) -> Result<(), ApiError> {
+    error!("secure worker input publication requires Linux openat2 and renameat2");
+    Err(ApiError::Internal)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn create_secure_upload_target(
+    _state: &AppState,
+    _id: Uuid,
+) -> Result<SecureUploadTarget, ApiError> {
+    error!("secure private upload requires Linux openat2 and renameat2");
+    Err(ApiError::Internal)
+}
+
 async fn receive_upload(
     state: &AppState,
-    job_dir: &Path,
+    id: Uuid,
     multipart: &mut Multipart,
     cancellation: &CancellationToken,
 ) -> Result<PendingUpload, ApiError> {
@@ -1381,9 +1905,7 @@ async fn receive_upload(
             pending.filename = Some(sanitize_filename(
                 field.file_name().unwrap_or("document.pdf"),
             ));
-            let partial_path = job_dir.join("input.partial");
-            let final_path = job_dir.join("input.pdf");
-            let mut output = File::create(&partial_path).await.map_err(internal_error)?;
+            let mut output = create_secure_upload_target(state, id).await?;
             let mut written = 0_u64;
             let mut prefix = BytesMut::new();
             loop {
@@ -1409,17 +1931,21 @@ async fn receive_upload(
                     let remaining = 5 - prefix.len();
                     prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                 }
-                output.write_all(&chunk).await.map_err(internal_error)?;
+                output
+                    .file
+                    .as_mut()
+                    .ok_or(ApiError::Internal)?
+                    .write_all(&chunk)
+                    .await
+                    .map_err(internal_error)?;
             }
-            output.flush().await.map_err(internal_error)?;
-            output.sync_all().await.map_err(internal_error)?;
-            drop(output);
+            let output_file = output.file.as_mut().ok_or(ApiError::Internal)?;
+            output_file.flush().await.map_err(internal_error)?;
+            output_file.sync_all().await.map_err(internal_error)?;
             if written == 0 || prefix.as_ref() != b"%PDF-" {
                 return Err(ApiError::BadRequest("文件不是有效的 PDF".to_owned()));
             }
-            fs::rename(partial_path, final_path)
-                .await
-                .map_err(internal_error)?;
+            output.publish().await?;
         } else {
             if !matches!(
                 name.as_str(),
@@ -1429,6 +1955,10 @@ async fn receive_upload(
                     | "output_mono"
                     | "output_dual"
                     | "provider"
+                    | "provider_id"
+                    | "model_id"
+                    | "thinking_mode"
+                    | "reasoning_effort"
                     | "deepseek_model"
                     | "deepseek_thinking_mode"
                     | "deepseek_reasoning_effort"
@@ -1443,6 +1973,10 @@ async fn receive_upload(
                 "output_mono" => pending.output_mono = Some(parse_bool(&value)?),
                 "output_dual" => pending.output_dual = Some(parse_bool(&value)?),
                 "provider" => pending.provider = Some(value),
+                "provider_id" => pending.provider_id = Some(value),
+                "model_id" => pending.model_id = Some(value),
+                "thinking_mode" => pending.thinking_mode = Some(value),
+                "reasoning_effort" => pending.reasoning_effort = Some(value),
                 "deepseek_model" => pending.deepseek_model = Some(value),
                 "deepseek_thinking_mode" => pending.deepseek_thinking_mode = Some(value),
                 "deepseek_reasoning_effort" => pending.deepseek_reasoning_effort = Some(value),
@@ -1506,14 +2040,54 @@ fn validate_upload_options(pending: &PendingUpload) -> Result<JobOptions, ApiErr
     if !output_mono && !output_dual {
         return Err(ApiError::BadRequest("至少选择一种输出文件".to_owned()));
     }
-    let provider = match nonblank(pending.provider.as_deref()) {
-        None | Some("google") => TranslationProvider::Google,
-        Some("deepseek") => TranslationProvider::DeepSeek,
-        Some(_) => return Err(ApiError::BadRequest("不支持该翻译渠道".to_owned())),
+    let legacy_provider = nonblank(pending.provider.as_deref());
+    let explicit_provider_id = nonblank(pending.provider_id.as_deref());
+    if let (Some(legacy), Some(explicit)) = (legacy_provider, explicit_provider_id)
+        && legacy != explicit
+    {
+        return Err(ApiError::BadRequest("翻译渠道字段互相冲突".to_owned()));
+    }
+    let provider_id = explicit_provider_id
+        .or(legacy_provider)
+        .unwrap_or("google")
+        .to_owned();
+    if provider_id.len() > 64
+        || provider_id.is_empty()
+        || !provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ApiError::BadRequest("翻译渠道编号无效".to_owned()));
+    }
+    let provider = match provider_id.as_str() {
+        "google" => TranslationProvider::Google,
+        "deepseek" => TranslationProvider::DeepSeek,
+        _ => TranslationProvider::OpenAiCompatible,
     };
-    let requested_model = nonblank(pending.deepseek_model.as_deref());
-    let requested_thinking_mode = nonblank(pending.deepseek_thinking_mode.as_deref());
-    let requested_reasoning_effort = nonblank(pending.deepseek_reasoning_effort.as_deref());
+    let legacy_model = nonblank(pending.deepseek_model.as_deref());
+    let generic_model = nonblank(pending.model_id.as_deref());
+    if let (Some(legacy), Some(generic)) = (legacy_model, generic_model)
+        && legacy != generic
+    {
+        return Err(ApiError::BadRequest("模型字段互相冲突".to_owned()));
+    }
+    let requested_model = generic_model.or(legacy_model);
+    let legacy_thinking = nonblank(pending.deepseek_thinking_mode.as_deref());
+    let generic_thinking = nonblank(pending.thinking_mode.as_deref());
+    if let (Some(legacy), Some(generic)) = (legacy_thinking, generic_thinking)
+        && legacy != generic
+    {
+        return Err(ApiError::BadRequest("思考模式字段互相冲突".to_owned()));
+    }
+    let requested_thinking_mode = generic_thinking.or(legacy_thinking);
+    let legacy_effort = nonblank(pending.deepseek_reasoning_effort.as_deref());
+    let generic_effort = nonblank(pending.reasoning_effort.as_deref());
+    if let (Some(legacy), Some(generic)) = (legacy_effort, generic_effort)
+        && legacy != generic
+    {
+        return Err(ApiError::BadRequest("推理强度字段互相冲突".to_owned()));
+    }
+    let requested_reasoning_effort = generic_effort.or(legacy_effort);
     let (deepseek_model, deepseek_thinking_mode, deepseek_reasoning_effort) = match provider {
         TranslationProvider::Google => {
             if requested_model.is_some()
@@ -1546,12 +2120,11 @@ fn validate_upload_options(pending: &PendingUpload) -> Result<JobOptions, ApiErr
             };
             let reasoning_effort = match requested_reasoning_effort {
                 None => None,
-                Some("low") => Some(DeepSeekReasoningEffort::Low),
                 Some("high") => Some(DeepSeekReasoningEffort::High),
                 Some("max") => Some(DeepSeekReasoningEffort::Max),
                 Some(_) => {
                     return Err(ApiError::BadRequest(
-                        "DeepSeek 推理强度必须为 low、high 或 max".to_owned(),
+                        "DeepSeek 推理强度必须为 high 或 max".to_owned(),
                     ));
                 }
             };
@@ -1567,6 +2140,30 @@ fn validate_upload_options(pending: &PendingUpload) -> Result<JobOptions, ApiErr
             };
             (Some(model), thinking_mode, reasoning_effort)
         }
+        TranslationProvider::OpenAiCompatible => {
+            let model = requested_model
+                .ok_or_else(|| ApiError::BadRequest("OpenAI 兼容渠道必须指定模型".to_owned()))?;
+            if model.len() > 128 || model.chars().any(char::is_control) {
+                return Err(ApiError::BadRequest("模型编号无效".to_owned()));
+            }
+            if requested_thinking_mode.is_some() || requested_reasoning_effort.is_some() {
+                return Err(ApiError::BadRequest(
+                    "OpenAI 兼容渠道不接受 DeepSeek 专用选项".to_owned(),
+                ));
+            }
+            (None, None, None)
+        }
+    };
+    let model_id = match provider {
+        TranslationProvider::Google => None,
+        TranslationProvider::DeepSeek => Some(
+            match deepseek_model.expect("validated DeepSeek model is present") {
+                DeepSeekModel::V4Flash => DEEPSEEK_MODEL_FLASH,
+                DeepSeekModel::V4Pro => DEEPSEEK_MODEL_PRO,
+            }
+            .to_owned(),
+        ),
+        TranslationProvider::OpenAiCompatible => requested_model.map(str::to_owned),
     };
     Ok(JobOptions {
         source_lang,
@@ -1578,6 +2175,9 @@ fn validate_upload_options(pending: &PendingUpload) -> Result<JobOptions, ApiErr
         deepseek_model,
         deepseek_thinking_mode,
         deepseek_reasoning_effort,
+        provider_id,
+        provider_revision: None,
+        model_id,
     })
 }
 
@@ -1785,19 +2385,22 @@ async fn download_file(
     if snapshot.status != JobStatus::Succeeded {
         return Err(ApiError::BadRequest("任务尚未生成下载文件".to_owned()));
     }
-    let (available, filename, content_type) = match kind.as_str() {
+    let (available, artifact_name, filename, content_type) = match kind.as_str() {
         "mono" => (
             snapshot.files.mono,
+            "mono.pdf",
             "translated-mono.pdf",
             "application/pdf",
         ),
         "dual" => (
             snapshot.files.dual,
+            "dual.pdf",
             "translated-dual.pdf",
             "application/pdf",
         ),
         "glossary" => (
             snapshot.files.glossary,
+            "glossary.csv",
             "translated-glossary.csv",
             "text/csv; charset=utf-8",
         ),
@@ -1806,26 +2409,19 @@ async fn download_file(
     if !available {
         return Err(ApiError::NotFound);
     }
-    let extension = if kind == "glossary" { "csv" } else { "pdf" };
-    let file_path = entry
-        .job_dir
-        .join("output")
-        .join(format!("{kind}.{extension}"));
-    if !path_belongs_to_job(&state, id, &file_path) {
-        return Err(ApiError::Internal);
-    }
-    let file = File::open(&file_path)
-        .await
-        .map_err(|_| ApiError::NotFound)?;
-    let metadata = file.metadata().await.map_err(internal_error)?;
-    if !metadata.is_file() {
-        return Err(ApiError::NotFound);
-    }
+    let artifact_root = state.0.config.state_root.join("artifacts");
+    let (file, length) = tokio::task::spawn_blocking(move || {
+        open_published_artifact(&artifact_root, id, artifact_name)
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(|_| ApiError::NotFound)?;
+    let file = File::from_std(file);
     let body = Body::from_stream(ReaderStream::new(file));
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
-        .header(CONTENT_LENGTH, metadata.len())
+        .header(CONTENT_LENGTH, length)
         .header(
             CONTENT_DISPOSITION,
             format!("attachment; filename=\"{filename}\""),
@@ -1896,20 +2492,28 @@ async fn find_job_or_tombstone_prestart(
 }
 
 async fn request_cancellation(state: &AppState, entry: &Arc<JobEntry>, message: &str) -> bool {
-    let snapshot = {
-        let mut snapshot = entry.snapshot.write().await;
+    let committed = commit_job_update(state, entry, |snapshot| {
         if snapshot.status.is_terminal() || entry.cancellation.is_cancelled() {
             return false;
         }
-        entry.cancellation.cancel();
         snapshot.status = JobStatus::Cancelling;
         snapshot.stage = "正在取消".to_owned();
         snapshot.message = message.to_owned();
-        snapshot.revision = snapshot.revision.saturating_add(1);
-        snapshot.clone()
-    };
-    persist_and_publish(state, entry, snapshot).await;
-    true
+        // Set the token while the publish lock is still held so no progress
+        // revision can race in after this Cancelling candidate. Persistence
+        // failure below is fail-stop, leaving reconciliation to restart.
+        entry.cancellation.cancel();
+        true
+    })
+    .await;
+    match committed {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            error!(%error, "failed to durably persist requested cancellation");
+            fail_stop_coordinator("job cancellation could not be durably persisted")
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1922,9 +2526,12 @@ struct WorkerRequest {
     output_mono: bool,
     output_dual: bool,
     provider: TranslationProvider,
-    deepseek_model: Option<DeepSeekModel>,
-    deepseek_thinking_mode: Option<DeepSeekThinkingMode>,
-    deepseek_reasoning_effort: Option<DeepSeekReasoningEffort>,
+    model: Option<String>,
+    thinking_mode: Option<DeepSeekThinkingMode>,
+    reasoning_effort: Option<DeepSeekReasoningEffort>,
+    provider_name: Option<String>,
+    openai_base_url: Option<String>,
+    openai_api_key: Option<Zeroizing<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1932,9 +2539,7 @@ struct WorkerEvent {
     #[serde(rename = "type")]
     kind: String,
     progress: Option<f64>,
-    stage: Option<String>,
     message: Option<String>,
-    files: Option<JobFiles>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -1978,6 +2583,7 @@ async fn run_job(state: AppState, entry: Arc<JobEntry>) {
         if entry.cancellation.is_cancelled() {
             mark_cancelled(&state, &entry, "排队任务已取消").await;
             safe_remove_job_dir(&state, id).await;
+            release_job_admission(&entry);
             return;
         }
         tokio::select! {
@@ -1991,6 +2597,7 @@ async fn run_job(state: AppState, entry: Arc<JobEntry>) {
                             mark_failed(&state, &entry, "任务队列已关闭").await;
                         }
                         safe_remove_job_dir(&state, id).await;
+                        release_job_admission(&entry);
                         return;
                     }
                 }
@@ -1999,28 +2606,77 @@ async fn run_job(state: AppState, entry: Arc<JobEntry>) {
         }
     };
 
-    let starting_snapshot = {
-        let mut snapshot = entry.snapshot.write().await;
+    let starting_snapshot = match commit_job_update(&state, &entry, |snapshot| {
         if entry.cancellation.is_cancelled() || state.0.shutdown.is_cancelled() {
-            None
+            false
         } else {
             snapshot.status = JobStatus::Running;
             snapshot.stage = "启动翻译引擎".to_owned();
             snapshot.message = "正在连接内部翻译服务".to_owned();
             snapshot.started_at = Some(Utc::now());
-            snapshot.revision = snapshot.revision.saturating_add(1);
-            Some(snapshot.clone())
+            true
+        }
+    })
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            error!(%id, %error, "failed to durably persist job start");
+            fail_stop_coordinator("job start could not be durably persisted")
         }
     };
     let Some(starting_snapshot) = starting_snapshot else {
         mark_cancelled(&state, &entry, "任务已取消").await;
         safe_remove_job_dir(&state, id).await;
         drop(permit);
+        release_job_admission(&entry);
         return;
     };
-    persist_and_publish(&state, &entry, starting_snapshot).await;
 
-    let snapshot = entry.snapshot.read().await.clone();
+    let snapshot = starting_snapshot;
+    let Some(job_worker_identity) =
+        ready_worker_identity_for_provider(&state, snapshot.options.provider).await
+    else {
+        mark_failed(&state, &entry, "翻译服务暂时不可用").await;
+        cleanup_failed_job(&state, &entry, id).await;
+        drop(permit);
+        release_job_admission(&entry);
+        return;
+    };
+    let runtime_provider = entry
+        .runtime_provider
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let runtime_api_key = match runtime_provider.as_ref() {
+        Some(runtime) => match state.0.admin.open_runtime_secret(id, runtime) {
+            Ok(secret) => Some(secret),
+            Err(error) => {
+                warn!(%id, %error, "could not open the accepted in-memory provider credential");
+                mark_failed(&state, &entry, "任务凭据不可用").await;
+                cleanup_failed_job(&state, &entry, id).await;
+                drop(permit);
+                release_job_admission(&entry);
+                return;
+            }
+        },
+        None => None,
+    };
+    let (model, provider_name, openai_base_url, openai_api_key) = match runtime_provider {
+        Some(runtime) if snapshot.options.provider == TranslationProvider::DeepSeek => (
+            Some(runtime.model),
+            Some(runtime.provider_name),
+            None,
+            runtime_api_key,
+        ),
+        Some(runtime) => (
+            Some(runtime.model),
+            Some(runtime.provider_name),
+            Some(runtime.base_url),
+            runtime_api_key,
+        ),
+        None => (None, None, None, None),
+    };
     let request = WorkerRequest {
         input_path: entry
             .job_dir
@@ -2034,12 +2690,19 @@ async fn run_job(state: AppState, entry: Arc<JobEntry>) {
         output_mono: snapshot.options.output_mono,
         output_dual: snapshot.options.output_dual,
         provider: snapshot.options.provider,
-        deepseek_model: snapshot.options.deepseek_model,
-        deepseek_thinking_mode: snapshot.options.deepseek_thinking_mode,
-        deepseek_reasoning_effort: snapshot.options.deepseek_reasoning_effort,
+        model,
+        thinking_mode: snapshot.options.deepseek_thinking_mode,
+        reasoning_effort: snapshot.options.deepseek_reasoning_effort,
+        provider_name,
+        openai_base_url,
+        openai_api_key,
     };
 
-    match start_worker_job(&state, id, &request).await {
+    let worker_start = start_worker_job(&state, id, &request).await;
+    // The plaintext credential is needed only while serializing and sending
+    // the start request. Drop it immediately after that request completes.
+    drop(request);
+    match worker_start {
         Ok(WorkerStart::Running) => {}
         Ok(WorkerStart::Terminal(terminal)) => {
             finalize_confirmed_terminal(
@@ -2052,7 +2715,7 @@ async fn run_job(state: AppState, entry: Arc<JobEntry>) {
             )
             .await;
             cleanup_failed_job(&state, &entry, id).await;
-            drop(permit);
+            finish_job_isolation(&state, &entry, id, &job_worker_identity, permit).await;
             return;
         }
         Err(error_message) => {
@@ -2069,7 +2732,7 @@ async fn run_job(state: AppState, entry: Arc<JobEntry>) {
             )
             .await;
             cleanup_failed_job(&state, &entry, id).await;
-            drop(permit);
+            finish_job_isolation(&state, &entry, id, &job_worker_identity, permit).await;
             return;
         }
     }
@@ -2081,6 +2744,7 @@ async fn run_job(state: AppState, entry: Arc<JobEntry>) {
             snapshot.message = match snapshot.options.provider {
                 TranslationProvider::Google => "Google 翻译引擎已启动",
                 TranslationProvider::DeepSeek => "DeepSeek V4 翻译引擎已启动",
+                TranslationProvider::OpenAiCompatible => "OpenAI 兼容翻译引擎已启动",
             }
             .to_owned();
         }
@@ -2134,9 +2798,23 @@ async fn run_job(state: AppState, entry: Arc<JobEntry>) {
         }
     }
     cleanup_failed_job(&state, &entry, id).await;
-    // This permit is intentionally held until the Python event stream confirms
-    // a terminal state, which also confirms subprocess/IPC cleanup.
+    finish_job_isolation(&state, &entry, id, &job_worker_identity, permit).await;
+}
+
+async fn finish_job_isolation(
+    state: &AppState,
+    entry: &Arc<JobEntry>,
+    id: Uuid,
+    job_worker_identity: &WorkerIdentity,
+    permit: OwnedSemaphorePermit,
+) {
+    // A terminal event confirms the task subprocess, but a malicious document
+    // may have escaped that process group. Destroy the complete worker epoch,
+    // drain its replacement, and scrub the shared volume before another upload
+    // or task can be admitted.
+    let _ = await_automatic_worker_replacement(state, id, job_worker_identity.clone()).await;
     drop(permit);
+    release_job_admission(entry);
 }
 
 async fn start_worker_job(
@@ -2177,6 +2855,18 @@ async fn forward_cancellation(state: AppState, entry: Arc<JobEntry>, id: Uuid) -
 async fn cancel_worker_until_terminal(state: &AppState, id: Uuid) -> WorkerTerminal {
     let started_at = Instant::now();
     loop {
+        if let Ok(event) = fetch_worker_terminal_event(state, id).await {
+            let recovered = match event.kind.as_str() {
+                "finished" => Some(WorkerTerminal::Finished),
+                "failed" => Some(WorkerTerminal::Failed),
+                "cancelled" => Some(WorkerTerminal::Cancelled),
+                _ => None,
+            };
+            if let Some(terminal) = recovered {
+                info!(%id, ?terminal, "recovered authoritative worker terminal journal");
+                return terminal;
+            }
+        }
         let result = state
             .0
             .client
@@ -2218,35 +2908,66 @@ async fn cancel_worker_until_terminal(state: &AppState, id: Uuid) -> WorkerTermi
 }
 
 async fn force_recycle_worker(state: &AppState, id: Uuid) -> WorkerTerminal {
-    let mut previous_epoch = state.0.worker_epoch.read().await.clone();
+    let observed_identity = fetch_worker_health(state)
+        .await
+        .filter(|health| health.is_ready(state.0.config.concurrency))
+        .map(|health| health.identity());
+    let cached_identity = state.0.worker_identity.read().await.clone();
+    let previous_identity = observed_identity.or(cached_identity).unwrap_or_else(|| {
+        fail_stop_coordinator("Python worker did not expose a complete identity before recycle")
+    });
     warn!(
         %id,
-        epoch = previous_epoch.as_deref().unwrap_or("unknown"),
-        "worker cleanup deadline expired; requesting a fail-stop recycle"
+        epoch = %previous_identity.epoch,
+        container_boot_id = %previous_identity.container_boot_id,
+        "destroying the complete Python worker epoch before releasing job isolation"
     );
+    wait_for_worker_replacement(state, id, previous_identity, true).await
+}
 
-    let current_epoch = fetch_worker_health(state)
-        .await
-        .filter(|health| health.status == "ok" && health.supports_provider("google"))
-        .map(|health| health.epoch);
-    if current_epoch.as_deref() == previous_epoch.as_deref() || current_epoch.is_none() {
+async fn await_automatic_worker_replacement(
+    state: &AppState,
+    id: Uuid,
+    previous_identity: WorkerIdentity,
+) -> WorkerTerminal {
+    wait_for_worker_replacement(state, id, previous_identity, false).await
+}
+
+async fn wait_for_worker_replacement(
+    state: &AppState,
+    id: Uuid,
+    mut previous_identity: WorkerIdentity,
+    force_immediately: bool,
+) -> WorkerTerminal {
+    let mut fail_stop_requested = force_immediately;
+    if force_immediately {
         request_worker_fail_stop(state).await;
     }
     let recycle_started = Instant::now();
     let mut last_fail_stop = Instant::now();
+    let automatic_exit_deadline = state
+        .0
+        .config
+        .release_grace
+        .min(state.0.config.cancel_reconcile_timeout);
     loop {
         if recycle_started.elapsed() > state.0.config.worker_recycle_timeout {
             fail_stop_coordinator("Python worker could not be recycled before the hard deadline");
         }
         if let Some(health) = fetch_worker_health(state).await
-            && health.status == "ok"
-            && health.supports_provider("google")
-            && Some(health.epoch.as_str()) != previous_epoch.as_deref()
+            && health.is_ready(state.0.config.concurrency)
+            && health.is_replacement_for(&previous_identity)
         {
-            info!(%id, epoch = %health.epoch, "new Python worker epoch confirmed");
-            let epoch = health.epoch;
-            *state.0.worker_epoch.write().await = Some(epoch.clone());
+            let identity = health.identity();
+            info!(%id, epoch = %identity.epoch, container_boot_id = %identity.container_boot_id, "new Python worker container identity confirmed");
+            *state.0.worker_identity.write().await = Some(identity.clone());
             if drain_worker_until_idle(state).await {
+                if let Err(error) = purge_shared_job_root(state).await {
+                    error!(%error, "replacement worker was drained but shared storage could not be scrubbed");
+                    fail_stop_coordinator(
+                        "shared worker storage could not be scrubbed before admission release",
+                    );
+                }
                 let resume_started = Instant::now();
                 loop {
                     match resume_worker(state).await {
@@ -2261,12 +2982,18 @@ async fn force_recycle_worker(state: &AppState, id: Uuid) -> WorkerTerminal {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
-            warn!(epoch = %epoch, "replacement worker could not be drained and resumed; recycling it again");
-            previous_epoch = Some(epoch);
+            warn!(epoch = %identity.epoch, container_boot_id = %identity.container_boot_id, "replacement worker could not be drained and resumed; recycling it again");
+            previous_identity = identity;
             request_worker_fail_stop(state).await;
+            fail_stop_requested = true;
             last_fail_stop = Instant::now();
         }
-        if last_fail_stop.elapsed() >= Duration::from_secs(10) {
+        if !fail_stop_requested && recycle_started.elapsed() >= automatic_exit_deadline {
+            warn!(%id, "worker did not auto-exit after terminal state; requesting fail-stop");
+            request_worker_fail_stop(state).await;
+            fail_stop_requested = true;
+            last_fail_stop = Instant::now();
+        } else if fail_stop_requested && last_fail_stop.elapsed() >= Duration::from_secs(10) {
             request_worker_fail_stop(state).await;
             last_fail_stop = Instant::now();
         }
@@ -2373,7 +3100,7 @@ async fn finalize_confirmed_terminal(
                 }
                 Err(error) if terminal == WorkerTerminal::Finished => {
                     warn!(%id, %error, "terminal event was unavailable; validating shared output files");
-                    if let Some(files) = inspect_finished_files(entry).await {
+                    if let Ok(files) = confirm_materialized_outputs(state, entry, id).await {
                         update_job(state, entry, |snapshot| {
                             if snapshot.status.is_terminal() {
                                 return;
@@ -2428,35 +3155,367 @@ async fn fetch_worker_terminal_event(state: &AppState, id: Uuid) -> Result<Worke
         .map_err(|_| "翻译终态响应无效".to_owned())
 }
 
-async fn inspect_finished_files(entry: &Arc<JobEntry>) -> Option<JobFiles> {
-    let output_dir = entry.job_dir.join("output");
-    let mono = valid_pdf_file(&output_dir.join("mono.pdf")).await;
-    let dual = valid_pdf_file(&output_dir.join("dual.pdf")).await;
-    if !mono && !dual {
-        return None;
+async fn confirm_materialized_outputs(
+    state: &AppState,
+    _entry: &Arc<JobEntry>,
+    id: Uuid,
+) -> Result<JobFiles, String> {
+    let data_root = state.0.config.data_root.clone();
+    let artifact_root = state.0.config.state_root.join("artifacts");
+    let files =
+        tokio::task::spawn_blocking(move || promote_worker_outputs(&data_root, &artifact_root, id))
+            .await
+            .map_err(|_| "无法安全发布输出文件".to_owned())?
+            .map_err(|error| {
+                warn!(%id, %error, "worker output promotion was rejected");
+                "输出文件安全校验失败".to_owned()
+            })?;
+    // The worker terminal journal stays in shared storage until the resulting
+    // terminal snapshot has committed to SQLite. The replacement-worker scrub
+    // removes it only after that durable commit, so a Rust crash can reconcile
+    // this exact terminal event on restart.
+    Ok(files)
+}
+
+#[cfg(target_os = "linux")]
+fn promote_worker_outputs(
+    data_root: &Path,
+    artifact_root: &Path,
+    id: Uuid,
+) -> Result<JobFiles, BoxError> {
+    use rustix::fs::{Mode, OFlags, RenameFlags, ResolveFlags};
+
+    if let Some(files) = existing_published_artifacts(artifact_root, id)? {
+        return Ok(files);
     }
-    let glossary = fs::metadata(output_dir.join("glossary.csv"))
-        .await
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
-    Some(JobFiles {
+
+    let root_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let resolve = ResolveFlags::BENEATH
+        | ResolveFlags::NO_SYMLINKS
+        | ResolveFlags::NO_MAGICLINKS
+        | ResolveFlags::NO_XDEV;
+    let data_root_fd = rustix::fs::open(data_root, root_flags, Mode::empty())?;
+    let output_fd = rustix::fs::openat2(
+        &data_root_fd,
+        format!("{id}/output"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        resolve,
+    )?;
+    let artifact_root_fd = rustix::fs::open(artifact_root, root_flags, Mode::empty())?;
+    let staging_name = format!(".{id}.{}.tmp", Uuid::new_v4());
+    let final_name = id.to_string();
+    let staging_path = artifact_root.join(&staging_name);
+    let final_path = artifact_root.join(&final_name);
+    rustix::fs::mkdirat(&artifact_root_fd, staging_name.as_str(), Mode::RWXU)?;
+    let mut renamed = false;
+    let result = (|| -> Result<JobFiles, BoxError> {
+        let staging_fd = rustix::fs::openat2(
+            &artifact_root_fd,
+            staging_name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            resolve,
+        )?;
+        let mut total_bytes = 0_u64;
+        let mono = copy_worker_artifact(
+            &output_fd,
+            &staging_fd,
+            "mono.pdf",
+            true,
+            MAX_PDF_ARTIFACT_BYTES,
+            &mut total_bytes,
+            resolve,
+        )?;
+        let dual = copy_worker_artifact(
+            &output_fd,
+            &staging_fd,
+            "dual.pdf",
+            true,
+            MAX_PDF_ARTIFACT_BYTES,
+            &mut total_bytes,
+            resolve,
+        )?;
+        if !mono && !dual {
+            return Err("worker produced no valid PDF artifact".into());
+        }
+        let glossary = copy_worker_artifact(
+            &output_fd,
+            &staging_fd,
+            "glossary.csv",
+            false,
+            MAX_GLOSSARY_ARTIFACT_BYTES,
+            &mut total_bytes,
+            resolve,
+        )?;
+        rustix::fs::fsync(&staging_fd)?;
+        rustix::fs::renameat_with(
+            &artifact_root_fd,
+            staging_name.as_str(),
+            &artifact_root_fd,
+            final_name.as_str(),
+            RenameFlags::NOREPLACE,
+        )?;
+        renamed = true;
+        rustix::fs::fsync(&artifact_root_fd)?;
+        Ok(JobFiles {
+            mono,
+            dual,
+            glossary,
+        })
+    })();
+    if result.is_err() {
+        let cleanup_path = if renamed { &final_path } else { &staging_path };
+        let _ = std::fs::remove_dir_all(cleanup_path);
+        let _ = rustix::fs::fsync(&artifact_root_fd);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn existing_published_artifacts(
+    artifact_root: &Path,
+    id: Uuid,
+) -> Result<Option<JobFiles>, BoxError> {
+    let final_path = artifact_root.join(id.to_string());
+    let metadata = match std::fs::symlink_metadata(&final_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("published artifact location is not a trusted directory".into());
+    }
+
+    let mut total_bytes = 0_u64;
+    let mono = validate_existing_published_artifact(
+        artifact_root,
+        id,
+        "mono.pdf",
+        MAX_PDF_ARTIFACT_BYTES,
+        &mut total_bytes,
+    )?;
+    let dual = validate_existing_published_artifact(
+        artifact_root,
+        id,
+        "dual.pdf",
+        MAX_PDF_ARTIFACT_BYTES,
+        &mut total_bytes,
+    )?;
+    if !mono && !dual {
+        return Err("published artifact directory contains no valid PDF".into());
+    }
+    let glossary = validate_existing_published_artifact(
+        artifact_root,
+        id,
+        "glossary.csv",
+        MAX_GLOSSARY_ARTIFACT_BYTES,
+        &mut total_bytes,
+    )?;
+    Ok(Some(JobFiles {
         mono,
         dual,
         glossary,
-    })
+    }))
 }
 
-async fn valid_pdf_file(path: &Path) -> bool {
-    let Ok(mut file) = File::open(path).await else {
-        return false;
+#[cfg(target_os = "linux")]
+fn validate_existing_published_artifact(
+    artifact_root: &Path,
+    id: Uuid,
+    name: &str,
+    max_bytes: u64,
+    total_bytes: &mut u64,
+) -> Result<bool, BoxError> {
+    let path = artifact_root.join(id.to_string()).join(name);
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!("published artifact {name} is not a regular file").into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    let (_, length) = open_published_artifact(artifact_root, id, name)?;
+    account_artifact_bytes(name, length, max_bytes, total_bytes)?;
+    Ok(true)
+}
+
+fn account_artifact_bytes(
+    name: &str,
+    length: u64,
+    max_bytes: u64,
+    total_bytes: &mut u64,
+) -> Result<(), BoxError> {
+    if length > max_bytes {
+        return Err(format!("worker artifact {name} exceeds its size limit").into());
+    }
+    let next_total = total_bytes
+        .checked_add(length)
+        .ok_or("worker artifact size overflow")?;
+    if next_total > MAX_TOTAL_ARTIFACT_BYTES {
+        return Err("worker artifacts exceed the aggregate size limit".into());
+    }
+    *total_bytes = next_total;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_worker_artifact(
+    output_fd: &rustix::fd::OwnedFd,
+    staging_fd: &rustix::fd::OwnedFd,
+    name: &str,
+    require_pdf_magic: bool,
+    max_bytes: u64,
+    total_bytes: &mut u64,
+    resolve: rustix::fs::ResolveFlags,
+) -> Result<bool, BoxError> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+
+    let source_fd = match rustix::fs::openat2(
+        output_fd,
+        name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+        resolve,
+    ) {
+        Ok(file) => file,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(false),
+        Err(error) => return Err(error.into()),
     };
-    let Ok(metadata) = file.metadata().await else {
-        return false;
-    };
-    if !metadata.is_file() || metadata.len() < 5 {
+    let mut source = std::fs::File::from(source_fd);
+    let metadata = source.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(format!("worker artifact {name} is not a non-empty regular file").into());
+    }
+    if metadata.nlink() != 1 {
+        return Err(format!("worker artifact {name} has an unsafe hard-link count").into());
+    }
+    account_artifact_bytes(name, metadata.len(), max_bytes, total_bytes)?;
+    if require_pdf_magic {
+        if metadata.len() < 5 {
+            return Err(format!("worker artifact {name} is too short").into());
+        }
+        let mut prefix = [0_u8; 5];
+        std::io::Read::read_exact(&mut source, &mut prefix)?;
+        if &prefix != b"%PDF-" {
+            return Err(format!("worker artifact {name} is not a PDF").into());
+        }
+        std::io::Seek::rewind(&mut source)?;
+    }
+    let destination_fd = rustix::fs::openat2(
+        staging_fd,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+        resolve,
+    )?;
+    let mut destination = std::fs::File::from(destination_fd);
+    let mut limited = std::io::Read::take(&mut source, metadata.len());
+    let copied = std::io::copy(&mut limited, &mut destination)?;
+    if copied != metadata.len() {
+        return Err(format!("worker artifact {name} changed while being copied").into());
+    }
+    let final_metadata = source.metadata()?;
+    if final_metadata.len() != metadata.len()
+        || final_metadata.nlink() != metadata.nlink()
+        || final_metadata.mtime() != metadata.mtime()
+        || final_metadata.mtime_nsec() != metadata.mtime_nsec()
+        || final_metadata.ctime() != metadata.ctime()
+        || final_metadata.ctime_nsec() != metadata.ctime_nsec()
+    {
+        return Err(format!("worker artifact {name} changed while being copied").into());
+    }
+    std::io::Write::flush(&mut destination)?;
+    destination.sync_all()?;
+    if require_pdf_magic {
+        std::io::Seek::rewind(&mut destination)?;
+        let mut prefix = [0_u8; 5];
+        std::io::Read::read_exact(&mut destination, &mut prefix)?;
+        if &prefix != b"%PDF-" {
+            return Err(format!("published artifact {name} failed PDF validation").into());
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn promote_worker_outputs(
+    _data_root: &Path,
+    _artifact_root: &Path,
+    _id: Uuid,
+) -> Result<JobFiles, BoxError> {
+    Err("secure worker output promotion requires Linux openat2".into())
+}
+
+#[cfg(target_os = "linux")]
+fn open_published_artifact(
+    artifact_root: &Path,
+    id: Uuid,
+    name: &str,
+) -> Result<(std::fs::File, u64), BoxError> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+
+    let root_fd = rustix::fs::open(
+        artifact_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    let resolve = ResolveFlags::BENEATH
+        | ResolveFlags::NO_SYMLINKS
+        | ResolveFlags::NO_MAGICLINKS
+        | ResolveFlags::NO_XDEV;
+    let file_fd = rustix::fs::openat2(
+        &root_fd,
+        format!("{id}/{name}"),
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+        resolve,
+    )?;
+    let mut file = std::fs::File::from(file_fd);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err("published artifact is not a non-empty regular file".into());
+    }
+    if name.ends_with(".pdf") {
+        if metadata.len() < 5 {
+            return Err("published PDF artifact is too short".into());
+        }
+        let mut prefix = [0_u8; 5];
+        std::io::Read::read_exact(&mut file, &mut prefix)?;
+        if &prefix != b"%PDF-" {
+            return Err("published PDF artifact has invalid magic".into());
+        }
+        std::io::Seek::rewind(&mut file)?;
+    }
+    Ok((file, metadata.len()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_published_artifact(
+    _artifact_root: &Path,
+    _id: Uuid,
+    _name: &str,
+) -> Result<(std::fs::File, u64), BoxError> {
+    Err("secure artifact downloads require Linux openat2".into())
+}
+
+async fn published_artifacts_are_valid(state: &AppState, id: Uuid, files: &JobFiles) -> bool {
+    if !files.mono && !files.dual {
         return false;
     }
-    let mut prefix = [0_u8; 5];
-    file.read_exact(&mut prefix).await.is_ok() && &prefix == b"%PDF-"
+    let artifact_root = state.0.config.state_root.join("artifacts");
+    let files = files.clone();
+    tokio::task::spawn_blocking(move || {
+        (!files.mono || open_published_artifact(&artifact_root, id, "mono.pdf").is_ok())
+            && (!files.dual || open_published_artifact(&artifact_root, id, "dual.pdf").is_ok())
+            && (!files.glossary
+                || open_published_artifact(&artifact_root, id, "glossary.csv").is_ok())
+    })
+    .await
+    .unwrap_or(false)
 }
 
 async fn cleanup_failed_job(state: &AppState, entry: &Arc<JobEntry>, id: Uuid) {
@@ -2527,41 +3586,38 @@ async fn apply_worker_event(state: &AppState, entry: &Arc<JobEntry>, event: Work
                     snapshot.status = JobStatus::Running;
                     snapshot.progress =
                         event.progress.unwrap_or(snapshot.progress).clamp(0.0, 99.9);
-                    if let Some(stage) = event.stage {
-                        snapshot.stage = stage;
-                    }
-                    if let Some(message) = event.message {
-                        snapshot.message = message;
-                    }
+                    snapshot.stage = "正在翻译".to_owned();
+                    snapshot.message = "翻译处理中".to_owned();
                 }
             })
             .await;
             false
         }
         "finished" => {
+            let id = entry.snapshot.read().await.id;
+            let files = match confirm_materialized_outputs(state, entry, id).await {
+                Ok(files) => files,
+                Err(error) => {
+                    mark_failed(state, entry, &error).await;
+                    return true;
+                }
+            };
             update_job(state, entry, |snapshot| {
                 if snapshot.status.is_terminal() {
                     return;
                 }
                 snapshot.status = JobStatus::Succeeded;
                 snapshot.progress = 100.0;
-                snapshot.stage = event.stage.unwrap_or_else(|| "翻译完成".to_owned());
-                snapshot.message = event
-                    .message
-                    .unwrap_or_else(|| "文件已经可以下载".to_owned());
-                snapshot.files = event.files.unwrap_or_default();
+                snapshot.stage = "翻译完成".to_owned();
+                snapshot.message = "文件已经可以下载".to_owned();
+                snapshot.files = files;
                 snapshot.finished_at = Some(Utc::now());
             })
             .await;
             true
         }
         "cancelled" => {
-            mark_cancelled(
-                state,
-                entry,
-                event.message.as_deref().unwrap_or("翻译任务已安全取消"),
-            )
-            .await;
+            mark_cancelled(state, entry, "翻译任务已安全取消").await;
             true
         }
         "failed" => {
@@ -2576,35 +3632,65 @@ async fn update_job<F>(state: &AppState, entry: &Arc<JobEntry>, update: F)
 where
     F: FnOnce(&mut JobSnapshot),
 {
-    let snapshot = {
-        let mut snapshot = entry.snapshot.write().await;
-        update(&mut snapshot);
-        snapshot.revision = snapshot.revision.saturating_add(1);
-        snapshot.clone()
+    let committed = commit_job_update(state, entry, |snapshot| {
+        update(snapshot);
+        true
+    })
+    .await;
+    let snapshot = match committed {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            error!(%error, "failed to durably persist job snapshot");
+            // Continuing could erase the only worker terminal journal and
+            // release the single-job permit while SQLite still says Running.
+            fail_stop_coordinator("job snapshot could not be durably persisted")
+        }
     };
-    let terminal = snapshot.status.is_terminal();
-    persist_and_publish(state, entry, snapshot).await;
-    if terminal {
-        entry
-            .admission_permit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+    if snapshot.is_some_and(|snapshot| snapshot.status.is_terminal()) {
+        clear_runtime_provider(entry);
     }
 }
 
-async fn persist_and_publish(state: &AppState, entry: &Arc<JobEntry>, snapshot: JobSnapshot) {
+async fn commit_job_update<F>(
+    state: &AppState,
+    entry: &Arc<JobEntry>,
+    update: F,
+) -> Result<Option<JobSnapshot>, BoxError>
+where
+    F: FnOnce(&mut JobSnapshot) -> bool,
+{
     let _publish_guard = entry.publish_lock.lock().await;
     if entry.disposed.load(AtomicOrdering::Acquire) {
-        return;
+        return Ok(None);
     }
-    if entry.snapshot.read().await.revision > snapshot.revision {
-        return;
+
+    // Build a candidate without exposing it to request handlers or SSE. The
+    // persisted row is the commit point; only then replace memory and publish.
+    let mut candidate = entry.snapshot.read().await.clone();
+    if !update(&mut candidate) {
+        return Ok(None);
     }
-    if let Err(error) = state.0.persistence.save(&snapshot).await {
-        error!(id = %snapshot.id, %error, "failed to persist job snapshot");
-    }
-    let _ = entry.sender.send(snapshot);
+    candidate.revision = candidate.revision.saturating_add(1);
+    state.0.persistence.save(&candidate).await?;
+    *entry.snapshot.write().await = candidate.clone();
+    let _ = entry.sender.send(candidate.clone());
+    Ok(Some(candidate))
+}
+
+fn release_job_admission(entry: &Arc<JobEntry>) {
+    entry
+        .admission_permit
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+}
+
+fn clear_runtime_provider(entry: &Arc<JobEntry>) {
+    entry
+        .runtime_provider
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
 }
 
 async fn mark_cancelled(state: &AppState, entry: &Arc<JobEntry>, message: &str) {
@@ -2637,12 +3723,15 @@ async fn mark_failed(state: &AppState, entry: &Arc<JobEntry>, message: &str) {
 }
 
 fn sanitize_public_error(message: &str) -> String {
-    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    let truncated = single_line.chars().take(240).collect::<String>();
-    if truncated.is_empty() {
-        "翻译服务发生未知错误".to_owned()
-    } else {
-        truncated
+    const GENERIC: &str = "翻译服务暂时无法完成任务，请稍后重试";
+    match message.trim() {
+        "翻译渠道认证失败，请联系管理员检查密钥"
+        | "翻译渠道请求过于频繁或额度不足，请稍后重试"
+        | "翻译渠道响应超时，请稍后重试"
+        | "无法连接翻译渠道，请稍后重试"
+        | "翻译渠道拒绝了请求，请联系管理员检查模型配置"
+        | GENERIC => message.trim().to_owned(),
+        _ => GENERIC.to_owned(),
     }
 }
 
@@ -2665,26 +3754,25 @@ async fn request_expired_lease_cancellation(state: &AppState, entry: &Arc<JobEnt
     if !expired {
         return false;
     }
-    let snapshot = {
-        let mut snapshot = entry.snapshot.write().await;
-        if !snapshot.status.is_active() || entry.cancellation.is_cancelled() {
-            return false;
-        }
-        entry.cancellation.cancel();
-        snapshot.status = JobStatus::Cancelling;
-        snapshot.stage = "正在取消".to_owned();
-        snapshot.message = if release_expired {
-            "页面离开后未恢复，正在回收任务".to_owned()
-        } else {
-            "页面连接已失效，正在回收任务".to_owned()
-        };
-        snapshot.revision = snapshot.revision.saturating_add(1);
-        snapshot.clone()
+    let mut snapshot = entry.snapshot.read().await.clone();
+    if !snapshot.status.is_active() || entry.cancellation.is_cancelled() {
+        return false;
+    }
+    snapshot.status = JobStatus::Cancelling;
+    snapshot.stage = "正在取消".to_owned();
+    snapshot.message = if release_expired {
+        "页面离开后未恢复，正在回收任务".to_owned()
+    } else {
+        "页面连接已失效，正在回收任务".to_owned()
     };
+    snapshot.revision = snapshot.revision.saturating_add(1);
     info!(id = %snapshot.id, release_expired, "job lease expired; requesting cancellation");
     if let Err(error) = state.0.persistence.save(&snapshot).await {
         error!(id = %snapshot.id, %error, "failed to persist lease-expired cancellation");
+        fail_stop_coordinator("lease cancellation could not be durably persisted");
     }
+    *entry.snapshot.write().await = snapshot.clone();
+    entry.cancellation.cancel();
     let _ = entry.sender.send(snapshot);
     true
 }
@@ -2772,6 +3860,65 @@ async fn safe_remove_job_dir(state: &AppState, id: Uuid) {
     }
 }
 
+async fn purge_shared_job_root(state: &AppState) -> Result<(), BoxError> {
+    let root = state.0.config.data_root.clone();
+    tokio::task::spawn_blocking(move || purge_shared_job_root_sync(&root))
+        .await
+        .map_err(|error| format!("shared storage scrub task failed: {error}"))??;
+    Ok(())
+}
+
+fn purge_shared_job_root_sync(root: &Path) -> Result<(), BoxError> {
+    let root_metadata = std::fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err("shared job root is not a trusted directory".into());
+    }
+
+    // This runs only after the replacement worker has been drained, so there
+    // is no legitimate concurrent writer. A hostile old worker may have left
+    // mode-000 directories; restore owner traversal top-down without following
+    // symlinks, then remove every entry from the trusted root.
+    make_shared_tree_owner_accessible(root)?;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    if std::fs::read_dir(root)?.next().transpose()?.is_some() {
+        return Err("shared job root was repopulated during isolation scrub".into());
+    }
+    Ok(())
+}
+
+fn make_shared_tree_owner_accessible(root: &Path) -> Result<(), BoxError> {
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let metadata = std::fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("shared storage directory changed type during scrub".into());
+        }
+        #[cfg(unix)]
+        {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(permissions.mode() | 0o700);
+            std::fs::set_permissions(&directory, permissions)?;
+        }
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() && !file_type.is_symlink() {
+                directories.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn cleanup_orphan_job_dirs(state: &AppState) {
     let known_ids = state
         .0
@@ -2816,10 +3963,127 @@ async fn cleanup_orphan_job_dirs(state: &AppState) {
     }
 }
 
+async fn cleanup_orphan_artifact_dirs(state: &AppState) {
+    let entries = state
+        .0
+        .jobs
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut succeeded_ids = HashSet::new();
+    for entry in entries {
+        let snapshot = entry.snapshot.read().await;
+        if snapshot.status == JobStatus::Succeeded {
+            succeeded_ids.insert(snapshot.id);
+        }
+    }
+    let artifact_root = state.0.config.state_root.join("artifacts");
+    let mut entries = match fs::read_dir(&artifact_root).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(%error, "failed to scan published artifact storage");
+            return;
+        }
+    };
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(%error, "failed while scanning published artifact storage");
+                break;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let retained = Uuid::parse_str(&name)
+            .ok()
+            .is_some_and(|id| id.to_string() == name && succeeded_ids.contains(&id));
+        if retained {
+            continue;
+        }
+        let path = entry.path();
+        let result = match entry.file_type().await {
+            Ok(file_type) if file_type.is_dir() => fs::remove_dir_all(&path).await,
+            Ok(_) => fs::remove_file(&path).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            warn!(path = %path.display(), %error, "failed to remove orphan published artifact entry");
+        }
+    }
+}
+
+async fn cleanup_orphan_private_uploads(state: &AppState) {
+    let upload_root = state.0.config.state_root.join("uploads");
+    let mut entries = match fs::read_dir(&upload_root).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(%error, "failed to scan private upload storage");
+            return;
+        }
+    };
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(%error, "failed while scanning private upload storage");
+                break;
+            }
+        };
+        let path = entry.path();
+        let result = match entry.file_type().await {
+            Ok(file_type) if file_type.is_dir() => fs::remove_dir_all(&path).await,
+            Ok(_) => fs::remove_file(&path).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            warn!(path = %path.display(), %error, "failed to remove orphan private upload entry");
+        }
+    }
+}
+
 async fn remove_job_files(state: &AppState, id: Uuid) -> Result<(), BoxError> {
+    let upload_result = remove_private_upload(state, id).await;
+    let worker_result = remove_worker_job_files(state, id).await;
+    let artifact_result = remove_published_artifacts(state, id).await;
+    upload_result?;
+    worker_result?;
+    artifact_result
+}
+
+async fn remove_private_upload(state: &AppState, id: Uuid) -> Result<(), BoxError> {
+    let root = state.0.config.state_root.join("uploads");
+    let path = root.join(id.to_string());
+    if path.parent() != Some(root.as_path()) {
+        return Err("refusing to remove an unsafe private upload path".into());
+    }
+    match fs::remove_dir_all(&path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn remove_worker_job_files(state: &AppState, id: Uuid) -> Result<(), BoxError> {
     let path = state.0.config.data_root.join(id.to_string());
     if !path_belongs_to_job(state, id, &path) {
         return Err("refusing to remove an unsafe job path".into());
+    }
+    match fs::remove_dir_all(&path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn remove_published_artifacts(state: &AppState, id: Uuid) -> Result<(), BoxError> {
+    let root = state.0.config.state_root.join("artifacts");
+    let path = root.join(id.to_string());
+    if path.parent() != Some(root.as_path()) {
+        return Err("refusing to remove an unsafe artifact path".into());
     }
     match fs::remove_dir_all(&path).await {
         Ok(()) => Ok(()),
@@ -2850,6 +4114,8 @@ mod tests {
     use tokio::sync::Notify;
     use tower::ServiceExt;
 
+    static MOCK_WORKER_EPOCH: AtomicUsize = AtomicUsize::new(1);
+
     #[test]
     fn page_ranges_are_normalized_and_validated() {
         assert_eq!(
@@ -2867,6 +4133,288 @@ mod tests {
         assert_eq!(sanitize_filename("../../paper.pdf"), ".._.._paper.pdf");
         assert_eq!(sanitize_filename("notes.txt"), "document.pdf");
         assert_eq!(sanitize_filename("论文.pdf"), "论文.pdf");
+    }
+
+    #[test]
+    fn public_job_errors_are_strictly_allow_listed() {
+        let allowed = "翻译渠道认证失败，请联系管理员检查密钥";
+        assert_eq!(sanitize_public_error(allowed), allowed);
+        assert_eq!(
+            sanitize_public_error("upstream leaked response body: secret-token"),
+            "翻译服务暂时无法完成任务，请稍后重试"
+        );
+        assert_eq!(
+            sanitize_public_error("翻译渠道认证失败，请联系管理员检查密钥: detail"),
+            "翻译服务暂时无法完成任务，请稍后重试"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_client_does_not_follow_redirects() {
+        let app = Router::new()
+            .route(
+                "/redirect",
+                get(|| async { axum::response::Redirect::temporary("/target") }),
+            )
+            .route("/target", get(|| async { StatusCode::OK }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let response = build_worker_client()
+            .unwrap()
+            .get(format!("http://{address}/redirect"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        server.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regular_worker_outputs_are_promoted_to_private_artifact_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("jobs");
+        let artifact_root = temp.path().join("state/artifacts");
+        std::fs::create_dir_all(&data_root).unwrap();
+        std::fs::create_dir_all(&artifact_root).unwrap();
+        let id = Uuid::new_v4();
+        let job_dir = data_root.join(id.to_string());
+        let output_dir = job_dir.join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("mono.pdf"), b"%PDF-result").unwrap();
+
+        let files = promote_worker_outputs(&data_root, &artifact_root, id).unwrap();
+        assert!(files.mono);
+        let (mut published, length) =
+            open_published_artifact(&artifact_root, id, "mono.pdf").unwrap();
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut published, &mut body).unwrap();
+        assert_eq!(length, body.len() as u64);
+        assert_eq!(body, b"%PDF-result");
+
+        // A crash after the private-directory rename but before the SQLite
+        // terminal commit must be recoverable without touching shared input.
+        let recovered = promote_worker_outputs(&data_root, &artifact_root, id).unwrap();
+        assert!(recovered.mono);
+        assert!(!recovered.dual);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_output_symlink_cannot_publish_or_download_an_external_secret() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("jobs");
+        let artifact_root = temp.path().join("state/artifacts");
+        let id = Uuid::new_v4();
+        let output_dir = data_root.join(id.to_string()).join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::create_dir_all(&artifact_root).unwrap();
+        std::fs::write(output_dir.join("mono.pdf"), b"%PDF-result").unwrap();
+        let external_secret = temp.path().join("master-key");
+        std::fs::write(&external_secret, b"super-secret-master-key").unwrap();
+        symlink(&external_secret, output_dir.join("glossary.csv")).unwrap();
+
+        assert!(promote_worker_outputs(&data_root, &artifact_root, id).is_err());
+        assert!(!artifact_root.join(id.to_string()).exists());
+        assert!(open_published_artifact(&artifact_root, id, "glossary.csv").is_err());
+        assert_eq!(
+            std::fs::read(&external_secret).unwrap(),
+            b"super-secret-master-key"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_output_fifo_is_rejected_without_blocking() {
+        use rustix::fs::{Mode, OFlags};
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("jobs");
+        let artifact_root = temp.path().join("state/artifacts");
+        let id = Uuid::new_v4();
+        let output_dir = data_root.join(id.to_string()).join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::create_dir_all(&artifact_root).unwrap();
+        let output_fd = rustix::fs::open(
+            &output_dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        rustix::fs::mkfifoat(&output_fd, "mono.pdf", Mode::RUSR | Mode::WUSR).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let worker_data_root = data_root.clone();
+        let worker_artifact_root = artifact_root.clone();
+        std::thread::spawn(move || {
+            let result = promote_worker_outputs(&worker_data_root, &worker_artifact_root, id);
+            let _ = sender.send(result.is_err());
+        });
+        assert!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "opening a hostile FIFO blocked artifact promotion"
+        );
+        assert!(!artifact_root.join(id.to_string()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_sparse_and_hardlinked_worker_outputs_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("jobs");
+        let artifact_root = temp.path().join("state/artifacts");
+        std::fs::create_dir_all(&artifact_root).unwrap();
+
+        let sparse_id = Uuid::new_v4();
+        let sparse_output = data_root.join(sparse_id.to_string()).join("output");
+        std::fs::create_dir_all(&sparse_output).unwrap();
+        let sparse = std::fs::File::create(sparse_output.join("mono.pdf")).unwrap();
+        sparse.set_len(MAX_PDF_ARTIFACT_BYTES + 1).unwrap();
+        drop(sparse);
+        assert!(promote_worker_outputs(&data_root, &artifact_root, sparse_id).is_err());
+        assert!(!artifact_root.join(sparse_id.to_string()).exists());
+
+        let hardlink_id = Uuid::new_v4();
+        let hardlink_output = data_root.join(hardlink_id.to_string()).join("output");
+        std::fs::create_dir_all(&hardlink_output).unwrap();
+        let external = temp.path().join("external.pdf");
+        std::fs::write(&external, b"%PDF-external").unwrap();
+        std::fs::hard_link(&external, hardlink_output.join("mono.pdf")).unwrap();
+        assert!(promote_worker_outputs(&data_root, &artifact_root, hardlink_id).is_err());
+        assert!(!artifact_root.join(hardlink_id.to_string()).exists());
+        assert_eq!(std::fs::read(external).unwrap(), b"%PDF-external");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_storage_scrub_repairs_mode_zero_trees_without_following_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("jobs");
+        let nested = root.join("hostile/deep");
+        let external = temp.path().join("outside-secret");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("payload"), b"worker-data").unwrap();
+        std::fs::write(&external, b"must-survive").unwrap();
+        symlink(&external, nested.join("escape")).unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(root.join("hostile"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        purge_shared_job_root_sync(&root).unwrap();
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        assert_eq!(std::fs::read(external).unwrap(), b"must-survive");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_upload_symlinks_are_never_followed_or_truncated() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("jobs");
+        let id = Uuid::new_v4();
+        let job_dir = data_root.join(id.to_string());
+        std::fs::create_dir_all(&job_dir).unwrap();
+        let external_secret = temp.path().join("state.sqlite3");
+        std::fs::write(&external_secret, b"must-not-be-truncated").unwrap();
+        symlink(&external_secret, job_dir.join("input.pdf")).unwrap();
+        symlink(&external_secret, job_dir.join("input.partial")).unwrap();
+
+        let (mut upload, job_dir_fd, staging_name) =
+            create_secure_upload_file(&data_root, id).unwrap();
+        std::io::Write::write_all(&mut upload, b"%PDF-new-upload").unwrap();
+        upload.sync_all().unwrap();
+        assert!(publish_secure_upload_file(upload, job_dir_fd, staging_name).is_err());
+        assert_eq!(
+            std::fs::read(&external_secret).unwrap(),
+            b"must-not-be-truncated"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_upload_is_materialized_once_into_a_fresh_shared_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let upload_root = temp.path().join("state/uploads");
+        let data_root = temp.path().join("jobs");
+        let id = Uuid::new_v4();
+        std::fs::create_dir_all(upload_root.join(id.to_string())).unwrap();
+        std::fs::create_dir_all(&data_root).unwrap();
+        std::fs::write(
+            upload_root.join(id.to_string()).join("input.pdf"),
+            b"%PDF-private-upload",
+        )
+        .unwrap();
+
+        materialize_worker_input(&upload_root, &data_root, id).unwrap();
+        assert_eq!(
+            std::fs::read(data_root.join(id.to_string()).join("input.pdf")).unwrap(),
+            b"%PDF-private-upload"
+        );
+        assert!(materialize_worker_input(&upload_root, &data_root, id).is_err());
+    }
+
+    #[test]
+    fn terminal_cleanup_drops_the_queued_sealed_provider_snapshot() {
+        let id = Uuid::new_v4();
+        let entry = JobEntry::new_with_runtime(
+            JobSnapshot::queued(
+                id,
+                "paper.pdf".to_owned(),
+                JobOptions {
+                    source_lang: "auto".to_owned(),
+                    target_lang: "zh".to_owned(),
+                    pages: None,
+                    output_mono: true,
+                    output_dual: false,
+                    provider: TranslationProvider::OpenAiCompatible,
+                    deepseek_model: None,
+                    deepseek_thinking_mode: None,
+                    deepseek_reasoning_effort: None,
+                    provider_id: "provider-a".to_owned(),
+                    provider_revision: Some(1),
+                    model_id: Some("model-a".to_owned()),
+                },
+            ),
+            PathBuf::from("unused-test-job"),
+            None,
+            Some(admin::RuntimeProvider {
+                provider_id: "provider-a".to_owned(),
+                provider_name: "Provider A".to_owned(),
+                kind: "openai_compatible".to_owned(),
+                revision: 1,
+                model: "model-a".to_owned(),
+                base_url: "https://api.example.test/v1".to_owned(),
+                sealed_api_key_ciphertext: vec![1, 2, 3],
+                sealed_api_key_nonce: vec![0; 24],
+                sealed_key_id: "primary-v1",
+            }),
+        );
+        assert!(
+            entry
+                .runtime_provider
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+        );
+        clear_runtime_provider(&entry);
+        assert!(
+            entry
+                .runtime_provider
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+        );
     }
 
     #[test]
@@ -2942,18 +4490,24 @@ mod tests {
             output_mono: enabled_defaults.output_mono,
             output_dual: enabled_defaults.output_dual,
             provider: enabled_defaults.provider,
-            deepseek_model: enabled_defaults.deepseek_model,
-            deepseek_thinking_mode: enabled_defaults.deepseek_thinking_mode,
-            deepseek_reasoning_effort: enabled_defaults.deepseek_reasoning_effort,
+            model: enabled_defaults.model_id.clone(),
+            thinking_mode: enabled_defaults.deepseek_thinking_mode,
+            reasoning_effort: enabled_defaults.deepseek_reasoning_effort,
+            provider_name: Some("DeepSeek".to_owned()),
+            openai_base_url: None,
+            openai_api_key: Some(Zeroizing::new("test-secret".to_owned())),
         })
         .unwrap();
         assert_eq!(worker_payload["provider"], "deepseek");
-        assert_eq!(worker_payload["deepseek_model"], DEEPSEEK_MODEL_PRO);
-        assert_eq!(worker_payload["deepseek_thinking_mode"], "enabled");
-        assert_eq!(worker_payload["deepseek_reasoning_effort"], "high");
+        assert_eq!(worker_payload["model"], DEEPSEEK_MODEL_PRO);
+        assert_eq!(worker_payload["thinking_mode"], "enabled");
+        assert_eq!(worker_payload["reasoning_effort"], "high");
+        assert_eq!(worker_payload["openai_base_url"], serde_json::Value::Null);
+        assert!(worker_payload.get("deepseek_model").is_none());
+        assert!(worker_payload.get("deepseek_thinking_mode").is_none());
+        assert!(worker_payload.get("deepseek_reasoning_effort").is_none());
 
         for (effort, expected) in [
-            ("low", DeepSeekReasoningEffort::Low),
             ("high", DeepSeekReasoningEffort::High),
             ("max", DeepSeekReasoningEffort::Max),
         ] {
@@ -2968,6 +4522,12 @@ mod tests {
         }
 
         for invalid in [
+            PendingUpload {
+                provider: Some("deepseek".to_owned()),
+                deepseek_thinking_mode: Some("enabled".to_owned()),
+                deepseek_reasoning_effort: Some("low".to_owned()),
+                ..PendingUpload::default()
+            },
             PendingUpload {
                 provider: Some("deepseek".to_owned()),
                 deepseek_model: Some("deepseek-v5".to_owned()),
@@ -3004,6 +4564,24 @@ mod tests {
     }
 
     #[test]
+    fn generic_provider_upload_stores_only_identity_revision_and_model() {
+        let options = validate_upload_options(&PendingUpload {
+            provider_id: Some("11111111-1111-4111-8111-111111111111".to_owned()),
+            model_id: Some("example/model".to_owned()),
+            ..PendingUpload::default()
+        })
+        .unwrap();
+        assert_eq!(options.provider, TranslationProvider::OpenAiCompatible);
+        assert_eq!(options.model_id.as_deref(), Some("example/model"));
+        assert_eq!(options.provider_revision, None);
+        let json = serde_json::to_string(&options).unwrap();
+        assert!(!json.contains("api_key"));
+        assert!(!json.contains("apiKey"));
+        assert!(!json.contains("base_url"));
+        assert!(!json.contains("baseUrl"));
+    }
+
+    #[test]
     fn legacy_persisted_snapshot_defaults_to_google() {
         let snapshot = JobSnapshot::queued(
             Uuid::new_v4(),
@@ -3018,6 +4596,9 @@ mod tests {
                 deepseek_model: None,
                 deepseek_thinking_mode: None,
                 deepseek_reasoning_effort: None,
+                provider_id: "google".to_owned(),
+                provider_revision: None,
+                model_id: None,
             },
         );
         let mut persisted = serde_json::to_value(snapshot).unwrap();
@@ -3030,6 +4611,9 @@ mod tests {
         persisted_options.remove("deepseekModel");
         persisted_options.remove("deepseekThinkingMode");
         persisted_options.remove("deepseekReasoningEffort");
+        persisted_options.remove("providerId");
+        persisted_options.remove("providerRevision");
+        persisted_options.remove("modelId");
 
         let restored: JobSnapshot = serde_json::from_value(persisted).unwrap();
         assert_eq!(restored.options.provider, TranslationProvider::Google);
@@ -3039,13 +4623,43 @@ mod tests {
     }
 
     #[test]
+    fn public_config_omits_anonymous_csrf_and_exposes_authenticated_csrf() {
+        let anonymous = serde_json::to_value(PublicConfig {
+            provider: "google",
+            providers: Vec::new(),
+            languages: Vec::new(),
+            max_upload_bytes: 1024,
+            csrf_token: None,
+        })
+        .unwrap();
+        assert!(anonymous.get("csrfToken").is_none());
+
+        let authenticated = serde_json::to_value(PublicConfig {
+            provider: "google",
+            providers: Vec::new(),
+            languages: Vec::new(),
+            max_upload_bytes: 1024,
+            csrf_token: Some("csrf-value".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(
+            authenticated
+                .get("csrfToken")
+                .and_then(|value| value.as_str()),
+            Some("csrf-value")
+        );
+    }
+
+    #[test]
     fn worker_health_capabilities_drive_public_provider_config() {
         let legacy: WorkerHealth = serde_json::from_value(serde_json::json!({
             "status": "ok",
             "provider": "google",
             "active_jobs": 0,
             "accepting_jobs": true,
-            "epoch": "legacy"
+            "epoch": "legacy",
+            "container_boot_id": "legacy-boot",
+            "max_active_jobs": 1
         }))
         .unwrap();
         assert!(legacy.is_ready(1));
@@ -3054,17 +4668,66 @@ mod tests {
 
         let capable: WorkerHealth = serde_json::from_value(serde_json::json!({
             "status": "ok",
-            "providers": ["google", "deepseek"],
+            "providers": ["google", "deepseek", "openai_compatible"],
             "active_jobs": 0,
             "accepting_jobs": true,
-            "epoch": "capable"
+            "epoch": "capable",
+            "container_boot_id": "capable-boot",
+            "max_active_jobs": 1
         }))
         .unwrap();
         assert!(capable.is_ready(1));
         assert!(capable.supports_provider("google"));
         assert!(capable.supports_provider("deepseek"));
-
-        let descriptors = public_provider_descriptors(Some(&capable), 1);
+        let prior_identity = capable.identity();
+        let only_epoch_changed: WorkerHealth = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "providers": ["google"],
+            "active_jobs": 0,
+            "accepting_jobs": true,
+            "epoch": "replacement-epoch",
+            "container_boot_id": "capable-boot",
+            "max_active_jobs": 1
+        }))
+        .unwrap();
+        assert!(!only_epoch_changed.is_replacement_for(&prior_identity));
+        let unsafe_capacity: WorkerHealth = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "providers": ["google"],
+            "active_jobs": 0,
+            "accepting_jobs": true,
+            "epoch": "replacement-epoch",
+            "container_boot_id": "replacement-boot",
+            "max_active_jobs": 4
+        }))
+        .unwrap();
+        assert!(unsafe_capacity.is_replacement_for(&prior_identity));
+        assert!(!unsafe_capacity.is_ready(1));
+        let anonymous = public_provider_descriptors(Some(&capable), Vec::new());
+        assert_eq!(anonymous.len(), 1);
+        assert_eq!(anonymous[0].id, "google");
+        let configured = vec![admin::PublicProviderConfig {
+            id: "deepseek".to_owned(),
+            kind: "deepseek".to_owned(),
+            name: "DeepSeek".to_owned(),
+            available: true,
+            unavailable_reason: None,
+            models: vec![
+                admin::PublicProviderModel {
+                    id: DEEPSEEK_MODEL_FLASH.to_owned(),
+                    name: "DeepSeek V4 Flash".to_owned(),
+                },
+                admin::PublicProviderModel {
+                    id: DEEPSEEK_MODEL_PRO.to_owned(),
+                    name: "DeepSeek V4 Pro".to_owned(),
+                },
+            ],
+            default_model: Some(DEEPSEEK_MODEL_FLASH.to_owned()),
+            thinking_modes: vec!["enabled".to_owned(), "disabled".to_owned()],
+            reasoning_efforts: vec!["high".to_owned(), "max".to_owned()],
+            default_reasoning_effort: Some("high".to_owned()),
+        }];
+        let descriptors = public_provider_descriptors(Some(&capable), configured.clone());
         assert_eq!(descriptors.len(), 2);
         assert_eq!(descriptors[0].id, "google");
         assert!(descriptors[0].available);
@@ -3073,43 +4736,51 @@ mod tests {
         assert_eq!(deepseek.id, "deepseek");
         assert!(deepseek.available);
         assert_eq!(deepseek.unavailable_reason, None);
-        assert_eq!(deepseek.default_model, Some(DEEPSEEK_MODEL_FLASH));
+        assert_eq!(
+            deepseek.default_model.as_deref(),
+            Some(DEEPSEEK_MODEL_FLASH)
+        );
         assert_eq!(
             deepseek
                 .models
                 .iter()
-                .map(|model| model.id)
+                .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
             vec![DEEPSEEK_MODEL_FLASH, DEEPSEEK_MODEL_PRO]
         );
-        assert_eq!(deepseek.reasoning_efforts, vec!["low", "high", "max"]);
-        assert_eq!(deepseek.default_reasoning_effort, Some("high"));
+        assert_eq!(deepseek.reasoning_efforts, vec!["high", "max"]);
+        assert_eq!(deepseek.default_reasoning_effort.as_deref(), Some("high"));
 
         let draining: WorkerHealth = serde_json::from_value(serde_json::json!({
             "status": "ok",
-            "providers": ["google", "deepseek"],
+            "providers": ["google", "deepseek", "openai_compatible"],
             "active_jobs": 1,
             "accepting_jobs": false,
-            "epoch": "draining"
+            "epoch": "draining",
+            "container_boot_id": "draining-boot",
+            "max_active_jobs": 1
         }))
         .unwrap();
         assert!(!draining.is_ready(1));
         assert!(
-            public_provider_descriptors(Some(&draining), 1)
+            public_provider_descriptors(Some(&draining), configured.clone())
                 .iter()
                 .all(|provider| provider.available)
         );
 
-        let unavailable = public_provider_descriptors(None, 1);
+        let unavailable = public_provider_descriptors(None, configured.clone());
         assert!(unavailable.iter().all(|provider| !provider.available));
         assert!(
-            unavailable
-                .iter()
-                .all(|provider| provider.unavailable_reason == Some("worker_unavailable"))
+            unavailable.iter().all(
+                |provider| provider.unavailable_reason.as_deref() == Some("worker_unavailable")
+            )
         );
-        let legacy_descriptors = public_provider_descriptors(Some(&legacy), 1);
+        let mut unconfigured = configured;
+        unconfigured[0].available = false;
+        unconfigured[0].unavailable_reason = Some("not_configured".to_owned());
+        let legacy_descriptors = public_provider_descriptors(Some(&capable), unconfigured);
         assert_eq!(
-            legacy_descriptors[1].unavailable_reason,
+            legacy_descriptors[1].unavailable_reason.as_deref(),
             Some("not_configured")
         );
         let public_config = serde_json::to_value(PublicConfig {
@@ -3117,6 +4788,7 @@ mod tests {
             providers: descriptors,
             languages: Vec::new(),
             max_upload_bytes: 1024,
+            csrf_token: None,
         })
         .unwrap();
         assert_eq!(public_config["provider"], "google");
@@ -3159,6 +4831,9 @@ mod tests {
                 deepseek_model: None,
                 deepseek_thinking_mode: None,
                 deepseek_reasoning_effort: None,
+                provider_id: "google".to_owned(),
+                provider_revision: None,
+                model_id: None,
             },
         );
         persistence.save(&good).await.unwrap();
@@ -3221,6 +4896,9 @@ mod tests {
                 deepseek_model: None,
                 deepseek_thinking_mode: None,
                 deepseek_reasoning_effort: None,
+                provider_id: "google".to_owned(),
+                provider_revision: None,
+                model_id: None,
             },
         );
         persistence.save(&snapshot).await.unwrap();
@@ -3252,6 +4930,9 @@ mod tests {
                 deepseek_model: None,
                 deepseek_thinking_mode: None,
                 deepseek_reasoning_effort: None,
+                provider_id: "google".to_owned(),
+                provider_revision: None,
+                model_id: None,
             },
         );
         persistence.save(&snapshot).await.unwrap();
@@ -3319,6 +5000,7 @@ mod tests {
         let data_root = temp.path().join("jobs");
         let mock_app = Router::new()
             .route("/internal/health", get(mock_health))
+            .route("/internal/fail-stop", post(mock_fail_stop))
             .route("/internal/drain", post(mock_drain))
             .route("/internal/resume", post(mock_resume));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3336,7 +5018,7 @@ mod tests {
             max_upload_bytes: 1024 * 1024,
             upload_timeout: Duration::from_secs(60),
             concurrency: 1,
-            max_active_jobs: 8,
+            max_active_jobs: 1,
             lease_timeout: Duration::from_secs(60),
             release_grace: Duration::from_secs(10),
             cancel_reconcile_timeout: Duration::from_secs(30),
@@ -3360,6 +5042,9 @@ mod tests {
                 deepseek_model: None,
                 deepseek_thinking_mode: None,
                 deepseek_reasoning_effort: None,
+                provider_id: "google".to_owned(),
+                provider_revision: None,
+                model_id: None,
             },
         );
         snapshot.status = JobStatus::Cancelled;
@@ -3411,13 +5096,21 @@ mod tests {
     }
 
     async fn mock_health() -> Json<serde_json::Value> {
+        let epoch = MOCK_WORKER_EPOCH.load(Ordering::SeqCst);
         Json(serde_json::json!({
             "status": "ok",
             "provider": "google",
             "active_jobs": 0,
             "accepting_jobs": true,
-            "epoch": "mock-worker-epoch"
+            "epoch": format!("mock-worker-epoch-{epoch}"),
+            "container_boot_id": format!("mock-container-boot-{epoch}"),
+            "max_active_jobs": 1
         }))
+    }
+
+    async fn mock_fail_stop() -> StatusCode {
+        MOCK_WORKER_EPOCH.fetch_add(1, Ordering::SeqCst);
+        StatusCode::ACCEPTED
     }
 
     async fn mock_blocking_health(
@@ -3427,12 +5120,15 @@ mod tests {
             control.entered.notify_one();
             control.resume.notified().await;
         }
+        let epoch = MOCK_WORKER_EPOCH.load(Ordering::SeqCst);
         Json(serde_json::json!({
             "status": "ok",
             "provider": "google",
             "active_jobs": 0,
             "accepting_jobs": true,
-            "epoch": "blocking-worker-epoch"
+            "epoch": format!("blocking-worker-epoch-{epoch}"),
+            "container_boot_id": format!("blocking-container-boot-{epoch}"),
+            "max_active_jobs": 1
         }))
     }
 
@@ -3440,10 +5136,154 @@ mod tests {
         Json(serde_json::json!({"status": "ready", "active_jobs": 0}))
     }
 
-    #[tokio::test]
-    async fn deepseek_create_is_rejected_when_worker_lacks_capability() {
+    fn mock_app_config(root: &Path, worker_url: String) -> AppConfig {
+        AppConfig {
+            port: 0,
+            data_root: root.join("jobs"),
+            state_root: root.join("state"),
+            frontend_dir: root.join("frontend"),
+            worker_url,
+            worker_token: "test-token".to_owned(),
+            max_upload_bytes: 1024 * 1024,
+            upload_timeout: Duration::from_secs(60),
+            concurrency: 1,
+            max_active_jobs: 1,
+            lease_timeout: Duration::from_secs(60),
+            release_grace: Duration::from_secs(10),
+            cancel_reconcile_timeout: Duration::from_secs(30),
+            worker_recycle_timeout: Duration::from_secs(60),
+            terminal_retention: Duration::from_secs(60),
+            id_tombstone_retention: Duration::from_secs(60),
+        }
+    }
+
+    async fn state_with_mock_worker(root: &Path) -> (AppState, tokio::task::JoinHandle<()>) {
         let mock_app = Router::new()
             .route("/internal/health", get(mock_health))
+            .route("/internal/fail-stop", post(mock_fail_stop))
+            .route("/internal/drain", post(mock_drain))
+            .route("/internal/resume", post(mock_resume));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+        let state = AppState::new(mock_app_config(root, format!("http://{address}")))
+            .await
+            .unwrap();
+        (state, server)
+    }
+
+    #[tokio::test]
+    async fn small_api_body_limit_does_not_reduce_the_upload_allowance() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, server) = state_with_mock_worker(temp.path()).await;
+        let app = build_router(state);
+        let oversized = vec![b'x'; SMALL_API_BODY_BYTES + 1];
+        let content_length = oversized.len().to_string();
+
+        for uri in ["/api/admin/login", "/api/not-a-real-route"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header(CONTENT_LENGTH, &content_length)
+                        .body(Body::from(oversized.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+        }
+
+        let upload_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs")
+                    .header(CONTENT_TYPE, "multipart/form-data; boundary=test-boundary")
+                    .header(CONTENT_LENGTH, content_length)
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(upload_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        server.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_terminal_commit_keeps_memory_broadcast_and_worker_journal_unmodified() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, server) = state_with_mock_worker(temp.path()).await;
+        let id = Uuid::new_v4();
+        let output_dir = state.0.config.data_root.join(id.to_string()).join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("mono.pdf"), b"%PDF-result").unwrap();
+        let journal = output_dir.join(".worker-terminal.json");
+        std::fs::write(&journal, br#"{"type":"finished"}"#).unwrap();
+
+        let mut snapshot = JobSnapshot::queued(
+            id,
+            "paper.pdf".to_owned(),
+            JobOptions {
+                source_lang: "auto".to_owned(),
+                target_lang: "zh".to_owned(),
+                pages: None,
+                output_mono: true,
+                output_dual: false,
+                provider: TranslationProvider::Google,
+                deepseek_model: None,
+                deepseek_thinking_mode: None,
+                deepseek_reasoning_effort: None,
+                provider_id: "google".to_owned(),
+                provider_revision: None,
+                model_id: None,
+            },
+        );
+        snapshot.status = JobStatus::Running;
+        snapshot.stage = "正在翻译".to_owned();
+        state.0.persistence.save(&snapshot).await.unwrap();
+        let entry = JobEntry::new(
+            snapshot.clone(),
+            state.0.config.data_root.join(id.to_string()),
+        );
+        state.0.jobs.write().await.insert(id, entry.clone());
+
+        let files = confirm_materialized_outputs(&state, &entry, id)
+            .await
+            .unwrap();
+        assert!(files.mono);
+        assert_eq!(std::fs::read(&journal).unwrap(), br#"{"type":"finished"}"#);
+        let mut receiver = entry.sender.subscribe();
+        state.0.persistence.pool.close().await;
+
+        let result = commit_job_update(&state, &entry, move |candidate| {
+            candidate.status = JobStatus::Succeeded;
+            candidate.files = files;
+            candidate.finished_at = Some(Utc::now());
+            true
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(entry.snapshot.read().await.status, JobStatus::Running);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(std::fs::read(journal).unwrap(), br#"{"type":"finished"}"#);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_google_only_worker_rejects_deepseek_capability() {
+        let mock_app = Router::new()
+            .route("/internal/health", get(mock_health))
+            .route("/internal/fail-stop", post(mock_fail_stop))
             .route("/internal/drain", post(mock_drain))
             .route("/internal/resume", post(mock_resume));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3452,10 +5292,9 @@ mod tests {
             axum::serve(listener, mock_app).await.unwrap();
         });
         let temp = tempfile::tempdir().unwrap();
-        let data_root = temp.path().join("jobs");
         let state = AppState::new(AppConfig {
             port: 0,
-            data_root: data_root.clone(),
+            data_root: temp.path().join("jobs"),
             state_root: temp.path().join("state"),
             frontend_dir: temp.path().join("frontend"),
             worker_url: format!("http://{address}"),
@@ -3463,7 +5302,7 @@ mod tests {
             max_upload_bytes: 1024 * 1024,
             upload_timeout: Duration::from_secs(60),
             concurrency: 1,
-            max_active_jobs: 8,
+            max_active_jobs: 1,
             lease_timeout: Duration::from_secs(60),
             release_grace: Duration::from_secs(10),
             cancel_reconcile_timeout: Duration::from_secs(30),
@@ -3473,36 +5312,9 @@ mod tests {
         })
         .await
         .unwrap();
-        let id = Uuid::new_v4();
-        let body = concat!(
-            "--deepseek-boundary\r\n",
-            "Content-Disposition: form-data; name=\"provider\"\r\n\r\n",
-            "deepseek\r\n",
-            "--deepseek-boundary\r\n",
-            "Content-Disposition: form-data; name=\"file\"; filename=\"paper.pdf\"\r\n",
-            "Content-Type: application/pdf\r\n\r\n",
-            "%PDF-1.7\n",
-            "\r\n--deepseek-boundary--\r\n"
-        );
-        let response = build_router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/jobs")
-                    .header("x-job-id", id.to_string())
-                    .header(
-                        CONTENT_TYPE,
-                        "multipart/form-data; boundary=deepseek-boundary",
-                    )
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(!state.0.jobs.read().await.contains_key(&id));
-        assert!(!data_root.join(id.to_string()).exists());
+        assert!(worker_is_ready_for_provider(&state, TranslationProvider::Google).await);
+        assert!(!worker_is_ready_for_provider(&state, TranslationProvider::DeepSeek).await);
         server.abort();
     }
 
@@ -3515,6 +5327,7 @@ mod tests {
         };
         let mock_app = Router::new()
             .route("/internal/health", get(mock_blocking_health))
+            .route("/internal/fail-stop", post(mock_fail_stop))
             .route("/internal/drain", post(mock_drain))
             .route("/internal/resume", post(mock_resume))
             .with_state(control.clone());
@@ -3536,7 +5349,7 @@ mod tests {
             max_upload_bytes: 1024 * 1024,
             upload_timeout: Duration::from_secs(60),
             concurrency: 1,
-            max_active_jobs: 8,
+            max_active_jobs: 1,
             lease_timeout: Duration::from_secs(60),
             release_grace: Duration::from_secs(10),
             cancel_reconcile_timeout: Duration::from_secs(30),
@@ -3620,6 +5433,7 @@ mod tests {
 
     async fn mock_events(State(worker): State<MockWorker>) -> String {
         worker.cancelled.notified().await;
+        MOCK_WORKER_EPOCH.fetch_add(1, Ordering::SeqCst);
         "{\"type\":\"cancelled\",\"message\":\"cleaned\"}\n".to_owned()
     }
 
@@ -3630,6 +5444,7 @@ mod tests {
     async fn mock_cancel(State(worker): State<MockWorker>) -> Json<serde_json::Value> {
         worker.cancel_calls.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(100)).await;
+        MOCK_WORKER_EPOCH.fetch_add(1, Ordering::SeqCst);
         worker.cancelled.notify_one();
         Json(serde_json::json!({"status": "cancelled"}))
     }
@@ -3655,6 +5470,7 @@ mod tests {
         };
         let mock_app = Router::new()
             .route("/internal/health", get(mock_health))
+            .route("/internal/fail-stop", post(mock_fail_stop))
             .route("/internal/jobs/{id}", post(mock_start))
             .route("/internal/jobs/{id}/events", get(mock_events))
             .route("/internal/jobs/{id}/cancel", post(mock_cancel))
@@ -3679,7 +5495,7 @@ mod tests {
             max_upload_bytes: 1024 * 1024,
             upload_timeout: Duration::from_secs(60),
             concurrency: 1,
-            max_active_jobs: 8,
+            max_active_jobs: 1,
             lease_timeout: Duration::from_secs(60),
             release_grace: Duration::from_secs(10),
             cancel_reconcile_timeout: Duration::from_secs(30),
@@ -3688,6 +5504,18 @@ mod tests {
             id_tombstone_retention: Duration::from_secs(60),
         };
         let state = AppState::new(config).await.unwrap();
+        #[cfg(target_os = "linux")]
+        let escaped_target = {
+            use std::os::unix::fs::symlink;
+
+            let target = temp.path().join("outside-secret");
+            fs::write(&target, b"do-not-delete").await.unwrap();
+            symlink(&target, data_root.join("worker-leftover-link")).unwrap();
+            fs::write(data_root.join("worker-leftover-file"), b"junk")
+                .await
+                .unwrap();
+            target
+        };
         let id = Uuid::new_v4();
         let job_dir = data_root.join(id.to_string());
         fs::create_dir_all(&job_dir).await.unwrap();
@@ -3707,6 +5535,9 @@ mod tests {
                 deepseek_model: None,
                 deepseek_thinking_mode: None,
                 deepseek_reasoning_effort: None,
+                provider_id: "google".to_owned(),
+                provider_revision: None,
+                model_id: None,
             },
         );
         state.0.persistence.save(&snapshot).await.unwrap();
@@ -3728,6 +5559,17 @@ mod tests {
         assert_eq!(state.0.permits.available_permits(), 1);
         assert_eq!(mock.cancel_calls.load(Ordering::SeqCst), 1);
         assert!(!job_dir.exists());
+        assert!(
+            fs::read_dir(&data_root)
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(fs::read(escaped_target).await.unwrap(), b"do-not-delete");
         server.abort();
     }
 
@@ -3739,6 +5581,7 @@ mod tests {
         };
         let mock_app = Router::new()
             .route("/internal/health", get(mock_health))
+            .route("/internal/fail-stop", post(mock_fail_stop))
             .route("/internal/jobs/{id}", post(mock_start))
             .route("/internal/jobs/{id}/events", get(mock_broken_events))
             .route("/internal/jobs/{id}/cancel", post(mock_cancel))
@@ -3763,7 +5606,7 @@ mod tests {
             max_upload_bytes: 1024 * 1024,
             upload_timeout: Duration::from_secs(60),
             concurrency: 1,
-            max_active_jobs: 8,
+            max_active_jobs: 1,
             lease_timeout: Duration::from_secs(60),
             release_grace: Duration::from_secs(10),
             cancel_reconcile_timeout: Duration::from_secs(30),
@@ -3792,6 +5635,9 @@ mod tests {
                 deepseek_model: None,
                 deepseek_thinking_mode: None,
                 deepseek_reasoning_effort: None,
+                provider_id: "google".to_owned(),
+                provider_revision: None,
+                model_id: None,
             },
         );
         state.0.persistence.save(&snapshot).await.unwrap();
@@ -3819,6 +5665,7 @@ mod tests {
         };
         let mock_app = Router::new()
             .route("/internal/health", get(mock_health))
+            .route("/internal/fail-stop", post(mock_fail_stop))
             .route("/internal/jobs/{id}", post(mock_start))
             .route("/internal/jobs/{id}/events", get(mock_events))
             .route("/internal/jobs/{id}/cancel", post(mock_cancel))
@@ -3843,7 +5690,7 @@ mod tests {
             max_upload_bytes: 1024 * 1024,
             upload_timeout: Duration::from_secs(60),
             concurrency: 1,
-            max_active_jobs: 8,
+            max_active_jobs: 1,
             lease_timeout: Duration::from_secs(60),
             release_grace: Duration::from_secs(10),
             cancel_reconcile_timeout: Duration::from_secs(30),
@@ -3872,6 +5719,9 @@ mod tests {
                 deepseek_model: None,
                 deepseek_thinking_mode: None,
                 deepseek_reasoning_effort: None,
+                provider_id: "google".to_owned(),
+                provider_revision: None,
+                model_id: None,
             },
         );
         let entry = JobEntry::new(snapshot, job_dir);

@@ -11,10 +11,6 @@ export default defineConfig({
         target: process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:7860",
         changeOrigin: true,
       },
-      "/assets": {
-        target: process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:7860",
-        changeOrigin: true,
-      },
     },
   },
   test: {

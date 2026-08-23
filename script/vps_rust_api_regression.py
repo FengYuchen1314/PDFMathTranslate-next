@@ -9,9 +9,13 @@ import time
 import uuid
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import Request
 from urllib.request import urlopen
+
+TRANSIENT_ADMISSION_STATUSES = {409, 429, 503}
+DEFAULT_ADMISSION_TIMEOUT = 240.0
 
 
 def request_json(
@@ -61,9 +65,10 @@ def expect_status(
 def multipart_payload(
     pdf: Path,
     pages: str,
-    provider: str = "google",
-    deepseek_model: str | None = None,
-    deepseek_thinking_mode: str | None = None,
+    provider_id: str = "google",
+    model_id: str | None = None,
+    thinking_mode: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[bytes, str]:
     boundary = f"----pdf2zh-{uuid.uuid4().hex}"
     chunks: list[bytes] = []
@@ -73,12 +78,14 @@ def multipart_payload(
         "pages": pages,
         "output_mono": "true",
         "output_dual": "true",
-        "provider": provider,
+        "provider_id": provider_id,
     }
-    if provider == "deepseek":
-        fields["deepseek_model"] = deepseek_model or "deepseek-v4-flash"
-        if deepseek_thinking_mode:
-            fields["deepseek_thinking_mode"] = deepseek_thinking_mode
+    if model_id:
+        fields["model_id"] = model_id
+    if thinking_mode:
+        fields["thinking_mode"] = thinking_mode
+    if reasoning_effort:
+        fields["reasoning_effort"] = reasoning_effort
     for name, value in fields.items():
         chunks.extend(
             [
@@ -110,31 +117,97 @@ def minimal_multipart_payload() -> tuple[bytes, str]:
     return f"--{boundary}--\r\n".encode(), boundary
 
 
+def wait_for_admission_ready(base_url: str, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    last_status = 0
+    last_body = b""
+    while True:
+        last_status, last_body = request_status(f"{base_url}/api/health")
+        if last_status == 200:
+            try:
+                health = json.loads(last_body)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError("health endpoint returned invalid JSON") from error
+            if isinstance(health, dict) and health.get("activeJobs") == 0:
+                return
+        elif last_status not in {429, 503}:
+            raise RuntimeError(
+                f"GET {base_url}/api/health returned {last_status}: "
+                f"{last_body.decode('utf-8', errors='replace')}"
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "coordinator did not expose a ready worker with zero active jobs: "
+                f"HTTP {last_status} {last_body.decode('utf-8', errors='replace')}"
+            )
+        time.sleep(1)
+
+
 def submit(
     base_url: str,
     pdf: Path,
     pages: str = "",
     job_id: str | None = None,
-    provider: str = "google",
-    deepseek_model: str | None = None,
-    deepseek_thinking_mode: str | None = None,
+    provider_id: str = "google",
+    model_id: str | None = None,
+    thinking_mode: str | None = None,
+    reasoning_effort: str | None = None,
+    admission_timeout: float = DEFAULT_ADMISSION_TIMEOUT,
 ) -> dict:
     payload, boundary = multipart_payload(
         pdf,
         pages,
-        provider=provider,
-        deepseek_model=deepseek_model,
-        deepseek_thinking_mode=deepseek_thinking_mode,
+        provider_id=provider_id,
+        model_id=model_id,
+        thinking_mode=thinking_mode,
+        reasoning_effort=reasoning_effort,
     )
     job_id = job_id or str(uuid.uuid4())
-    return request_json(
-        f"{base_url}/api/jobs",
-        method="POST",
-        data=payload,
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "x-job-id": job_id,
-        },
+    wait_for_admission_ready(base_url, admission_timeout)
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "x-job-id": job_id,
+    }
+    deadline = time.monotonic() + admission_timeout
+    last_status = 0
+    last_body = b""
+    while True:
+        try:
+            last_status, last_body = request_status(
+                f"{base_url}/api/jobs",
+                method="POST",
+                data=payload,
+                headers=headers,
+            )
+        except (ConnectionError, TimeoutError, URLError):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(1)
+            continue
+        if last_status in {200, 201, 202}:
+            try:
+                result = json.loads(last_body)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError("job submission returned invalid JSON") from error
+            if not isinstance(result, dict) or result.get("id") != job_id:
+                raise RuntimeError(
+                    f"job submission returned a mismatched response: {result!r}"
+                )
+            return result
+        if (
+            last_status not in TRANSIENT_ADMISSION_STATUSES
+            or time.monotonic() >= deadline
+        ):
+            break
+        # A terminal snapshot is published before the old worker generation is
+        # destroyed, its replacement is drained/scrubbed/resumed, and the
+        # global admission permit is released. Retrying this exact UUID and
+        # byte-identical multipart body is safe even if an earlier response was
+        # lost after the server accepted it.
+        time.sleep(1)
+    raise RuntimeError(
+        f"POST {base_url}/api/jobs did not become admissible: {last_status} "
+        f"{last_body.decode('utf-8', errors='replace')}"
     )
 
 
@@ -209,22 +282,42 @@ def main() -> None:
     parser.add_argument("base_url")
     parser.add_argument("long_pdf", type=Path)
     parser.add_argument("short_pdf", type=Path)
+    parser.add_argument(
+        "--lease-pdf",
+        type=Path,
+        help=(
+            "optional PDF guaranteed to run longer than the deployment lease; "
+            "used only for the abandoned-job reclamation check"
+        ),
+    )
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--start-timeout", type=float, default=120)
     parser.add_argument("--cancel-timeout", type=float, default=90)
     parser.add_argument("--finish-timeout", type=float, default=600)
-    parser.add_argument("--test-lease", action="store_true")
-    parser.add_argument("--expect-deepseek", action="store_true")
     parser.add_argument(
-        "--deepseek-model",
-        choices=("deepseek-v4-flash", "deepseek-v4-pro"),
-        default="deepseek-v4-flash",
+        "--lease-timeout",
+        type=float,
+        default=360,
+        help=(
+            "seconds allowed for an abandoned job to exceed the configured "
+            "lease and finish cancellation (default covers the 180s VPS lease)"
+        ),
     )
+    parser.add_argument("--test-lease", action="store_true")
     options = parser.parse_args()
     base_url = options.base_url.rstrip("/")
     parsed_base_url = urlsplit(base_url)
     if parsed_base_url.scheme not in {"http", "https"} or not parsed_base_url.netloc:
         raise ValueError("base_url must be an absolute HTTP(S) URL")
+
+    if parsed_base_url.scheme == "https":
+        with urlopen(f"{base_url}/", timeout=60) as response:  # noqa: S310
+            headers = response.headers
+            assert "max-age=" in headers.get("Strict-Transport-Security", "")
+            assert "default-src 'self'" in headers.get("Content-Security-Policy", "")
+            assert headers.get("X-Content-Type-Options") == "nosniff"
+            assert headers.get("X-Frame-Options") == "DENY"
+        print("gateway_security_headers=passed", flush=True)
 
     health = request_json(f"{base_url}/api/health")
     config = request_json(f"{base_url}/api/config")
@@ -232,25 +325,20 @@ def main() -> None:
     assert config["provider"] == "google", config
     assert "services" not in config, config
     providers = {provider["id"]: provider for provider in config["providers"]}
-    assert set(providers) == {"google", "deepseek"}, providers
+    assert set(providers) == {"google"}, providers
     assert providers["google"]["available"] is True, providers["google"]
-    deepseek = providers["deepseek"]
-    assert isinstance(deepseek["available"], bool), deepseek
-    assert deepseek["defaultModel"] == "deepseek-v4-flash", deepseek
-    assert [model["id"] for model in deepseek["models"]] == [
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-    ], deepseek
-    assert deepseek["thinkingModes"] == ["enabled", "disabled"], deepseek
-    assert deepseek["reasoningEfforts"] == ["low", "high", "max"], deepseek
-    assert deepseek["defaultReasoningEffort"] == "high", deepseek
+    assert "csrfToken" not in config, config
     assert "apiKey" not in json.dumps(config), config
-    if options.expect_deepseek:
-        assert deepseek["available"] is True, deepseek
-    print(
-        f"provider_contract=passed deepseek_available={deepseek['available']}",
-        flush=True,
-    )
+    assert "baseUrl" not in json.dumps(config), config
+    for provider_id, provider in providers.items():
+        assert provider["id"] == provider_id, provider
+        assert provider["kind"] in {"google", "deepseek", "openai_compatible"}, provider
+        if provider["kind"] == "openai_compatible":
+            assert provider["models"], provider
+            assert provider.get("defaultModel") in {
+                model["id"] for model in provider["models"]
+            }, provider
+    print("anonymous_google_only_contract=passed", flush=True)
 
     # A release/cancel beacon can beat the matching upload POST when a page is
     # closed immediately. Both UUIDs must be durably retired before any work
@@ -349,7 +437,7 @@ def main() -> None:
         )
         print("released_page_reclaimed=passed", flush=True)
 
-        abandoned = submit(base_url, options.long_pdf)
+        abandoned = submit(base_url, options.lease_pdf or options.long_pdf)
         wait_for_status(
             base_url,
             abandoned["id"],
@@ -360,7 +448,7 @@ def main() -> None:
             base_url,
             abandoned["id"],
             {"cancelled"},
-            options.cancel_timeout,
+            options.lease_timeout,
             keep_alive=False,
         )
         lease_probe = submit(base_url, options.long_pdf)
@@ -389,41 +477,6 @@ def main() -> None:
     ):
         raise RuntimeError("completed job exposed no PDF artifacts")
     print("successful_translation_and_download=passed", flush=True)
-
-    if options.expect_deepseek:
-        deepseek_job = submit(
-            base_url,
-            options.short_pdf,
-            pages="1",
-            provider="deepseek",
-            deepseek_model=options.deepseek_model,
-            deepseek_thinking_mode="disabled",
-        )
-        deepseek_result = wait_for_status(
-            base_url,
-            deepseek_job["id"],
-            {"succeeded"},
-            options.finish_timeout,
-        )
-        if deepseek_result.get("options", {}).get("provider") != "deepseek":
-            raise RuntimeError(
-                f"DeepSeek job lost its provider snapshot: {deepseek_result}"
-            )
-        if deepseek_result.get("files", {}).get("mono"):
-            assert_download(base_url, deepseek_job["id"], "mono")
-        elif deepseek_result.get("files", {}).get("dual"):
-            assert_download(base_url, deepseek_job["id"], "dual")
-        else:
-            raise RuntimeError("DeepSeek job exposed no PDF artifacts")
-        expect_status(
-            204,
-            f"{base_url}/api/jobs/{deepseek_job['id']}",
-            method="DELETE",
-        )
-        print(
-            f"deepseek_live_translation={options.deepseek_model}=passed",
-            flush=True,
-        )
 
     # Terminal release is recoverable during the grace period. Explicit DELETE
     # is the irreversible cleanup operation and leaves an ID tombstone.

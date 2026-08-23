@@ -1,4 +1,7 @@
 import asyncio
+import logging
+import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,45 +34,49 @@ def test_worker_defaults_to_google_settings(tmp_path):
     assert isinstance(settings.translate_engine_settings, GoogleSettings)
     assert settings.term_extraction_engine_settings is None
     assert settings.translation.no_auto_extract_glossary is True
+    assert settings.translation.ignore_cache is True
     assert settings.pdf.watermark_output_mode == "no_watermark"
 
 
 @pytest.mark.parametrize(
-    ("model", "thinking_mode", "reasoning_effort"),
+    ("model", "thinking_mode", "reasoning_effort", "sent_reasoning_effort"),
     [
-        ("deepseek-v4-flash", None, None),
-        ("deepseek-v4-pro", None, None),
-        ("deepseek-v4-flash", "disabled", None),
-        ("deepseek-v4-pro", "disabled", None),
-        ("deepseek-v4-flash", "enabled", "low"),
-        ("deepseek-v4-flash", "enabled", "high"),
-        ("deepseek-v4-pro", "enabled", "max"),
+        (None, None, None, None),
+        ("deepseek-v4-pro", None, None, None),
+        ("deepseek-v4-flash", "disabled", None, None),
+        ("deepseek-v4-pro", "disabled", None, None),
+        ("deepseek-v4-flash", "enabled", None, None),
+        ("deepseek-v4-flash", "enabled", "low", "high"),
+        ("deepseek-v4-flash", "enabled", "high", "high"),
+        ("deepseek-v4-pro", "enabled", "max", "max"),
     ],
 )
 def test_worker_builds_supported_deepseek_settings(
     tmp_path,
-    monkeypatch,
     model,
     thinking_mode,
     reasoning_effort,
+    sent_reasoning_effort,
 ):
-    monkeypatch.setenv("PDF2ZH_DEEPSEEK_API_KEY", "  server-secret  ")
     request = make_request(
         tmp_path / "input.pdf",
         tmp_path / "output",
         provider="deepseek",
-        deepseek_model=model,
-        deepseek_thinking_mode=thinking_mode,
-        deepseek_reasoning_effort=reasoning_effort,
+        model=model,
+        thinking_mode=thinking_mode,
+        reasoning_effort=reasoning_effort,
+        openai_api_key="  server-secret  ",
     )
 
     settings = worker_api._build_settings(request, tmp_path / "output")
     engine = settings.translate_engine_settings
 
     assert isinstance(engine, OpenAISettings)
-    assert engine.openai_model == model
+    assert engine.openai_model == (model or "deepseek-v4-flash")
     assert engine.openai_api_key == "server-secret"
     assert engine.openai_base_url == "https://api.deepseek.com"
+    assert "server-secret" not in repr(engine)
+    assert "server-secret" not in repr(settings)
     if thinking_mode is None:
         assert engine._openai_extra_body is None
         assert engine.openai_send_reasoning_effort is None
@@ -78,127 +85,574 @@ def test_worker_builds_supported_deepseek_settings(
             "thinking": {"type": thinking_mode},
         }
         if thinking_mode == "enabled":
-            assert engine.openai_send_reasoning_effort is True
-            assert engine.openai_reasoning_effort == reasoning_effort
+            if sent_reasoning_effort is None:
+                assert engine.openai_send_reasoning_effort is None
+            else:
+                assert engine.openai_send_reasoning_effort is True
+            assert engine.openai_reasoning_effort == sent_reasoning_effort
         else:
             assert engine.openai_send_reasoning_effort is None
             assert engine.openai_reasoning_effort is None
 
 
-@pytest.mark.parametrize("api_key", [None, "", "   "])
-def test_worker_rejects_deepseek_when_server_key_is_missing(
-    tmp_path, monkeypatch, api_key
-):
-    if api_key is None:
-        monkeypatch.delenv("PDF2ZH_DEEPSEEK_API_KEY", raising=False)
-    else:
-        monkeypatch.setenv("PDF2ZH_DEEPSEEK_API_KEY", api_key)
+def test_worker_does_not_fall_back_to_deepseek_environment_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("PDF2ZH_DEEPSEEK_API_KEY", "legacy-environment-secret")
+
+    with pytest.raises(ValueError, match="require an API key"):
+        make_request(
+            tmp_path / "input.pdf",
+            tmp_path / "output",
+            provider="deepseek",
+        )
+
+
+def test_worker_builds_openai_compatible_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        worker_api.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                worker_api.socket.AF_INET,
+                worker_api.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", 443),
+            )
+        ],
+    )
     request = make_request(
         tmp_path / "input.pdf",
         tmp_path / "output",
-        provider="deepseek",
-        deepseek_model="deepseek-v4-flash",
+        provider="openai_compatible",
+        provider_name="  Example Provider  ",
+        model="vendor/model  v1",
+        reasoning_effort="low",
+        openai_base_url="https://api.example.com/openai/v1/",
+        openai_api_key="  generic-secret  ",
     )
 
-    with pytest.raises(ValueError, match="not configured"):
-        worker_api._build_settings(request, tmp_path / "output")
+    settings = worker_api._build_settings(request, tmp_path / "output")
+    engine = settings.translate_engine_settings
+
+    assert isinstance(engine, OpenAISettings)
+    assert request.provider_name == "Example Provider"
+    assert engine.openai_model == "vendor/model  v1"
+    assert engine.openai_base_url == "https://api.example.com/openai/v1"
+    assert engine.openai_api_key == "generic-secret"
+    assert "generic-secret" not in repr(engine)
+    assert "generic-secret" not in repr(settings)
+    assert engine.openai_send_reasoning_effort is True
+    assert engine.openai_reasoning_effort == "low"
 
 
 @pytest.mark.parametrize(
     "overrides",
     [
         {"provider": "deepseek"},
-        {"deepseek_model": "deepseek-v4-flash"},
+        {"provider": "deepseek", "openai_api_key": "   "},
+        {"model": "deepseek-v4-flash"},
         {
             "provider": "deepseek",
-            "deepseek_model": "deepseek-chat",
+            "model": "deepseek-chat",
+            "openai_api_key": "secret",
         },
         {
             "provider": "deepseek",
-            "deepseek_model": "deepseek-v4-flash",
-            "deepseek_reasoning_effort": "high",
+            "model": "deepseek-v4-flash",
+            "reasoning_effort": "high",
+            "openai_api_key": "secret",
         },
         {
             "provider": "deepseek",
-            "deepseek_model": "deepseek-v4-pro",
-            "deepseek_thinking_mode": "disabled",
-            "deepseek_reasoning_effort": "max",
+            "openai_base_url": "https://api.deepseek.com",
+            "openai_api_key": "secret",
+        },
+        {
+            "provider": "google",
+            "model": "unexpected",
+        },
+        {
+            "provider": "openai_compatible",
+            "model": "gpt-test",
+            "openai_api_key": "secret",
+        },
+        {
+            "provider": "openai_compatible",
+            "openai_base_url": "https://api.example.com/v1",
+            "openai_api_key": "secret",
+        },
+        {
+            "provider": "openai_compatible",
+            "model": "gpt-test",
+            "openai_base_url": "https://api.example.com/v1",
+        },
+        {
+            "provider": "openai_compatible",
+            "model": "gpt-test",
+            "thinking_mode": "enabled",
+            "openai_base_url": "https://api.example.com/v1",
+            "openai_api_key": "secret",
         },
     ],
 )
-def test_worker_rejects_invalid_provider_option_combinations(tmp_path, overrides):
+def test_worker_rejects_invalid_provider_option_combinations(
+    tmp_path, monkeypatch, overrides
+):
+    monkeypatch.setattr(
+        worker_api.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                worker_api.socket.AF_INET,
+                worker_api.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", 443),
+            )
+        ],
+    )
     with pytest.raises(ValueError):
         make_request(tmp_path / "input.pdf", tmp_path / "output", **overrides)
 
 
-def test_worker_request_schema_cannot_accept_deepseek_secrets(tmp_path):
+def test_worker_request_secret_is_masked_and_422_never_echoes_input(tmp_path):
     schema = worker_api.TranslationRequest.model_json_schema()
     properties = schema["properties"]
 
     assert "api_key" not in properties
-    assert "deepseek_api_key" not in properties
     assert "base_url" not in properties
-    assert "deepseek_base_url" not in properties
     request = make_request(tmp_path / "input.pdf", tmp_path / "output")
-    assert all("key" not in name and "url" not in name for name in request.model_dump())
-    injected = make_request(
+    assert request.openai_api_key is None
+    assert request.openai_base_url is None
+    secret = "sk-current-request-secret-12345678"  # noqa: S105
+    configured = make_request(
         tmp_path / "input.pdf",
         tmp_path / "output",
         provider="deepseek",
-        deepseek_model="deepseek-v4-flash",
-        deepseek_api_key="client-secret",
-        deepseek_base_url="https://attacker.invalid",
+        model="deepseek-v4-flash",
+        openai_api_key=secret,
     )
-    assert "client-secret" not in repr(injected)
-    assert "attacker.invalid" not in repr(injected)
-    assert "deepseek_api_key" not in injected.model_dump()
-    assert "deepseek_base_url" not in injected.model_dump()
+    assert configured.openai_api_key.get_secret_value() == secret
+    assert secret not in repr(configured)
+    assert "openai_api_key" not in configured.model_dump()
+    assert secret not in str(configured.model_dump())
+    assert secret not in configured.model_dump_json()
+    assert secret not in repr(worker_api.WorkerJob(job_id="job", request=configured))
 
     with pytest.raises(ValueError) as exc_info:
         make_request(
             tmp_path / "input.pdf",
             tmp_path / "output",
-            provider="deepseek",
-            deepseek_api_key="client-secret",
+            provider="google",
+            openai_api_key=secret,
         )
-    assert "client-secret" not in str(exc_info.value)
+    assert secret not in str(exc_info.value)
     request_error = worker_api.RequestValidationError(exc_info.value.errors())
     response = asyncio.run(
         worker_api.sanitized_request_validation_error(None, request_error)
     )
-    assert b"client-secret" not in response.body
+    assert secret.encode() not in response.body
     assert b'"input"' not in response.body
 
+    with pytest.raises(ValueError) as extra_info:
+        make_request(
+            tmp_path / "input.pdf",
+            tmp_path / "output",
+            deepseek_api_key=secret,
+        )
+    extra_error = worker_api.RequestValidationError(extra_info.value.errors())
+    extra_response = asyncio.run(
+        worker_api.sanitized_request_validation_error(None, extra_error)
+    )
+    assert secret.encode() not in extra_response.body
+    assert b'"input"' not in extra_response.body
 
-def test_worker_health_reports_deepseek_only_when_server_key_exists(monkeypatch):
-    monkeypatch.delenv("PDF2ZH_DEEPSEEK_API_KEY", raising=False)
-    without_key = asyncio.run(worker_api.health(None))
 
-    monkeypatch.setenv("PDF2ZH_DEEPSEEK_API_KEY", "  server-secret  ")
-    with_key = asyncio.run(worker_api.health(None))
+def test_worker_health_reports_all_internal_engine_capabilities():
+    result = asyncio.run(worker_api.health(None))
 
-    assert without_key["provider"] == "google"
-    assert without_key["providers"] == ["google"]
-    assert with_key["provider"] == "google"
-    assert with_key["providers"] == ["google", "deepseek"]
-    assert "server-secret" not in repr(with_key)
+    assert result["provider"] == "google"
+    assert result["providers"] == ["google", "deepseek", "openai_compatible"]
+    assert result["max_active_jobs"] == 1
+    assert result["epoch"] == worker_api.WORKER_EPOCH
+    assert result["container_boot_id"] == worker_api.CONTAINER_BOOT_ID
 
 
-def test_public_error_redacts_deepseek_credentials(monkeypatch):
+def test_public_worker_requires_single_job_and_supervisor_boot_id(monkeypatch):
+    monkeypatch.setenv("PDF2ZH_MAX_ACTIVE_JOBS", "2")
+    with pytest.raises(RuntimeError, match="must be exactly 1"):
+        worker_api._validate_runtime_configuration()
+
+    monkeypatch.setenv("PDF2ZH_MAX_ACTIVE_JOBS", "1")
+    monkeypatch.setattr(worker_api, "PUBLIC_WORKER_MODE", True)
+    monkeypatch.setattr(worker_api, "_worker_process_has_app_identity", lambda: True)
+    monkeypatch.setattr(worker_api, "_CONFIGURED_CONTAINER_BOOT_ID", "")
+    with pytest.raises(RuntimeError, match="worker supervisor"):
+        worker_api._validate_runtime_configuration()
+
+    monkeypatch.setattr(
+        worker_api,
+        "_CONFIGURED_CONTAINER_BOOT_ID",
+        "bb166a87-51a7-4b79-8de4-f717cbfa5bd8",
+    )
+    worker_api._validate_runtime_configuration()
+
+
+def test_worker_token_pipe_is_consumed_and_not_left_for_translation_spawn(monkeypatch):
+    token_read_fd, token_write_fd = os.pipe()
+    try:
+        os.write(token_write_fd, b"coordinator-secret")
+    finally:
+        os.close(token_write_fd)
+    monkeypatch.setenv("PDF2ZH_WORKER_TOKEN_FD", str(token_read_fd))
+    monkeypatch.setenv("PDF2ZH_WORKER_TOKEN", "legacy-secret")
+
+    assert worker_api._consume_worker_token() == "coordinator-secret"
+    assert "PDF2ZH_WORKER_TOKEN_FD" not in os.environ
+    assert "PDF2ZH_WORKER_TOKEN" not in os.environ
+
+
+def test_retiring_public_worker_rejects_new_job_before_route_parsing(monkeypatch):
+    request = SimpleNamespace(
+        method="POST",
+        url=SimpleNamespace(path="/internal/jobs/new-job-id"),
+    )
+    call_next_called = False
+
+    async def call_next(_request):
+        nonlocal call_next_called
+        call_next_called = True
+        raise AssertionError("retiring worker delegated to request body parsing")
+
+    monkeypatch.setattr(worker_api, "PUBLIC_WORKER_MODE", True)
+    monkeypatch.setattr(worker_api, "_retire_requested", True)
+
+    response = asyncio.run(
+        worker_api.reject_job_body_after_terminal(request, call_next)
+    )
+
+    assert response.status_code == 503
+    assert call_next_called is False
+
+
+def test_public_error_maps_upstream_text_to_fixed_categories(tmp_path):
     configured_key = "sk-configured-secret-12345678"
-    monkeypatch.setenv("PDF2ZH_DEEPSEEK_API_KEY", configured_key)
+    request = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="deepseek",
+        openai_api_key=configured_key,
+    )
 
-    message = worker_api._public_error(
+    authentication = worker_api._public_error(
         "request failed "
         f"api_key={configured_key} "
         "Authorization: Bearer sk-header-secret-87654321 "
-        "access_token=another-sensitive-token"
+        "access_token=another-sensitive-token",
+        request,
     )
 
-    assert configured_key not in message
-    assert "sk-header-secret-87654321" not in message
-    assert "another-sensitive-token" not in message
-    assert message.count("<redacted>") >= 3
+    assert authentication == "翻译渠道认证失败，请联系管理员检查密钥"
+    arbitrary = worker_api._public_error(
+        "upstream echoed a confidential paragraph from the uploaded paper",
+        request,
+    )
+    assert arbitrary == "翻译服务暂时无法完成任务，请稍后重试"
+    assert configured_key not in authentication
+    assert "confidential paragraph" not in arbitrary
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://api.example.com/v1",
+        "https://user:password@api.example.com/v1",
+        "https://api.example.com/v1?target=http://127.0.0.1",
+        "https://api.example.com/v1#fragment",
+        "https://localhost/v1",
+        "https://service.internal/v1",
+        "https://127%2e0%2e0%2e1/v1",
+        "https://127.0.0.1/v1",
+        "https://10.0.0.8/v1",
+        "https://169.254.169.254/latest/meta-data",
+        "https://[::1]/v1",
+        "https://0.0.0.0/v1",
+        "https://224.0.0.1/v1",
+    ],
+)
+def test_openai_compatible_rejects_unsafe_base_urls(tmp_path, base_url):
+    with pytest.raises(ValueError):
+        make_request(
+            tmp_path / "input.pdf",
+            tmp_path / "output",
+            provider="openai_compatible",
+            model="gpt-test",
+            openai_base_url=base_url,
+            openai_api_key="secret",
+        )
+
+
+def test_openai_compatible_rejects_hostname_resolving_private(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        worker_api.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                worker_api.socket.AF_INET,
+                worker_api.socket.SOCK_STREAM,
+                6,
+                "",
+                ("192.168.1.10", 443),
+            )
+        ],
+    )
+
+    request = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="openai_compatible",
+        model="gpt-test",
+        openai_base_url="https://api.example.com/v1",
+        openai_api_key="secret",
+    )
+    with pytest.raises(ValueError, match="resolve exclusively to public addresses"):
+        asyncio.run(worker_api._validate_openai_endpoint_for_job(request))
+
+
+def test_openai_compatible_fails_closed_on_dns_failure(tmp_path, monkeypatch):
+    def unavailable_dns(*_args, **_kwargs):
+        raise worker_api.socket.gaierror("temporary resolver failure")
+
+    monkeypatch.setattr(worker_api.socket, "getaddrinfo", unavailable_dns)
+
+    request = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="openai_compatible",
+        model="gpt-test",
+        openai_base_url="https://api.example.com/v1/",
+        openai_api_key="secret",
+    )
+    with pytest.raises(ValueError, match="resolve exclusively to public addresses"):
+        asyncio.run(worker_api._validate_openai_endpoint_for_job(request))
+
+
+def test_openai_compatible_fails_closed_on_empty_dns_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        worker_api.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [],
+    )
+
+    request = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="openai_compatible",
+        model="gpt-test",
+        openai_base_url="https://api.example.com/v1",
+        openai_api_key="secret",
+    )
+    with pytest.raises(ValueError, match="resolve exclusively to public addresses"):
+        asyncio.run(worker_api._validate_openai_endpoint_for_job(request))
+
+
+def test_openai_compatible_rechecks_dns_when_job_starts(tmp_path, monkeypatch):
+    answers = iter(["192.168.1.10"])
+
+    def changing_dns(*_args, **_kwargs):
+        address = next(answers)
+        return [
+            (
+                worker_api.socket.AF_INET,
+                worker_api.socket.SOCK_STREAM,
+                6,
+                "",
+                (address, 443),
+            )
+        ]
+
+    monkeypatch.setattr(worker_api.socket, "getaddrinfo", changing_dns)
+    request = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="openai_compatible",
+        model="gpt-test",
+        openai_base_url="https://api.example.com/v1",
+        openai_api_key="secret",
+    )
+
+    # Construction consumes no DNS response and cannot block FastAPI's event
+    # loop. The job-start authority performs the first and final app-level
+    # lookup immediately before creating the HTTP client.
+    with pytest.raises(ValueError, match="resolve exclusively to public addresses"):
+        asyncio.run(worker_api._validate_openai_endpoint_for_job(request))
+
+
+def test_openai_compatible_dns_timeout_requires_worker_recycle(tmp_path, monkeypatch):
+    release_resolver = threading.Event()
+
+    def stuck_resolver(*_args, **_kwargs):
+        release_resolver.wait(1)
+        return True
+
+    monkeypatch.setattr(
+        worker_api,
+        "_resolved_addresses_are_public",
+        stuck_resolver,
+    )
+    monkeypatch.setattr(worker_api, "DNS_RESOLUTION_TIMEOUT_SECONDS", 0.01)
+    request = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="openai_compatible",
+        model="gpt-test",
+        openai_base_url="https://api.example.com/v1",
+        openai_api_key="secret",
+    )
+
+    async def run():
+        try:
+            with pytest.raises(UnrecoverableCleanupError):
+                await worker_api._validate_openai_endpoint_for_job(request)
+        finally:
+            release_resolver.set()
+
+    asyncio.run(run())
+
+
+def test_terminal_journal_never_persists_current_request_secret(
+    tmp_path,
+):
+    secret = "sk-terminal-secret-12345678"  # noqa: S105
+    request = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="deepseek",
+        openai_api_key=secret,
+    )
+    terminal_path = tmp_path / "output" / worker_api.TERMINAL_JOURNAL_FILENAME
+    job = worker_api.WorkerJob(
+        job_id="560c2e2d-f17a-4052-9273-a5a956933a7d",
+        request=request,
+        terminal_journal_path=terminal_path,
+    )
+
+    asyncio.run(
+        job.emit(
+            {
+                "type": "failed",
+                "stage": "翻译失败",
+                "message": f"upstream included api_key={secret}",
+                "debug_detail": secret,
+            }
+        )
+    )
+
+    journal = terminal_path.read_text(encoding="utf-8")
+    assert secret not in journal
+    assert "翻译渠道认证失败" in journal
+    assert "debug_detail" not in journal
+
+
+@pytest.mark.parametrize(
+    "terminal_event",
+    [
+        {"type": "cancelled"},
+        {"type": "failed", "message": "provider failed"},
+        {
+            "type": "finished",
+            "files": {"mono": True, "dual": False, "glossary": False},
+        },
+    ],
+)
+def test_public_terminal_commit_closes_admission_then_requests_container_exit(
+    tmp_path, monkeypatch, terminal_event
+):
+    terminal_path = tmp_path / "output" / worker_api.TERMINAL_JOURNAL_FILENAME
+    request = make_request(tmp_path / "input.pdf", tmp_path / "output")
+    job = worker_api.WorkerJob(
+        job_id="560c2e2d-f17a-4052-9273-a5a956933a7d",
+        request=request,
+        terminal_journal_path=terminal_path,
+    )
+    timers = []
+
+    class PendingExitTimer:
+        daemon = False
+
+        def __init__(self, delay, target, args):
+            # Construction happens only after the terminal rename and directory
+            # fsync return. The journal must already be recoverable here.
+            assert (
+                worker_api._read_terminal_event(terminal_path, job.job_id)["type"]
+                == terminal_event["type"]
+            )
+            self.delay = delay
+            self.target = target
+            self.args = args
+            self.started = False
+            timers.append(self)
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(worker_api, "PUBLIC_WORKER_MODE", True)
+    monkeypatch.setattr(worker_api, "_accepting_jobs", True)
+    monkeypatch.setattr(worker_api, "_retire_requested", False)
+    monkeypatch.setattr(worker_api, "_recycle_scheduled", threading.Event())
+    monkeypatch.setattr(worker_api.threading, "Timer", PendingExitTimer)
+
+    asyncio.run(job.emit(terminal_event))
+
+    assert worker_api._accepting_jobs is False
+    assert worker_api._retire_requested is True
+    assert job.cleanup_complete.is_set()
+    assert len(timers) == 1
+    assert timers[0].started is True
+    assert timers[0].delay == worker_api.WORKER_RECYCLE_DELAY_SECONDS
+    assert timers[0].target is worker_api.os._exit
+    assert timers[0].args == (worker_api.WORKER_RECYCLE_EXIT_CODE,)
+    assert asyncio.run(worker_api.health(None))["status"] == "draining"
+
+    # A repeated terminal publication cannot arm a second exit timer.
+    asyncio.run(job.emit({"type": "failed"}))
+    assert len(timers) == 1
+
+
+def test_fail_stop_log_redacts_current_request_secret(tmp_path, monkeypatch, caplog):
+    class ExitObservedError(RuntimeError):
+        pass
+
+    secret = "sk-fail-stop-secret-12345678"  # noqa: S105
+    request = make_request(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        provider="deepseek",
+        openai_api_key=secret,
+    )
+
+    def observe_exit(_code):
+        raise ExitObservedError
+
+    monkeypatch.setattr(worker_api.os, "_exit", observe_exit)
+    caplog.set_level("CRITICAL", logger=worker_api.__name__)
+
+    with pytest.raises(ExitObservedError):
+        worker_api._fail_stop_worker(
+            "job",
+            RuntimeError(f"cleanup response contained {secret}"),
+            request,
+        )
+
+    assert secret not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+def test_public_worker_suppresses_private_translation_diagnostics():
+    private_logger = logging.getLogger("pdf2zh_next.high_level")
+
+    assert private_logger.level == logging.CRITICAL
+    assert private_logger.propagate is False
 
 
 def test_worker_rejects_auto_target_language(tmp_path):
@@ -260,6 +714,66 @@ def test_cancellation_event_is_emitted_after_stream_cleanup(tmp_path, monkeypatc
         assert cleanup_done.is_set()
         assert job.events[-1]["type"] == "cancelled"
         assert job.terminal is True
+
+    asyncio.run(run())
+
+
+def test_terminal_job_drops_retained_provider_secret(tmp_path, monkeypatch):
+    async def fake_translate(_settings, _input_path):
+        yield {
+            "type": "error",
+            "error": "provider unavailable",
+        }
+
+    monkeypatch.setattr(worker_api, "do_translate_async_stream", fake_translate)
+
+    async def run():
+        input_path = tmp_path / "input.pdf"
+        input_path.write_bytes(b"%PDF-1.7\n")
+        output_dir = tmp_path / "output"
+        request = make_request(
+            input_path,
+            output_dir,
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            openai_api_key="terminal-secret",
+        )
+        job = worker_api.WorkerJob(job_id="job", request=request)
+
+        await worker_api._run_translation(job, input_path, output_dir)
+
+        assert job.terminal is True
+        assert job.events[-1]["type"] == "failed"
+        assert job.request.openai_api_key is None
+
+    asyncio.run(run())
+
+
+def test_cancel_before_first_task_poll_drops_provider_secret(tmp_path):
+    async def run():
+        started = False
+
+        async def never_polled():
+            nonlocal started
+            started = True
+            await asyncio.sleep(60)
+
+        request = make_request(
+            tmp_path / "input.pdf",
+            tmp_path / "output",
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            openai_api_key="queued-secret",
+        )
+        job = worker_api.WorkerJob(job_id="job", request=request)
+        job.task = asyncio.create_task(never_polled())
+
+        state = await worker_api._cancel_existing_job(job)
+
+        assert started is False
+        assert state.status == "cancelled"
+        assert job.terminal is True
+        assert job.request.openai_api_key is None
 
     asyncio.run(run())
 
@@ -326,7 +840,7 @@ def test_unproven_subprocess_cleanup_uses_fail_stop_without_terminal(
         raise UnrecoverableCleanupError("process group remains alive")
         yield  # pragma: no cover - keeps this function an async generator
 
-    def fake_fail_stop(_job_id, _error):
+    def fake_fail_stop(_job_id, _error, _request=None):
         raise FailStopObservedError
 
     monkeypatch.setattr(worker_api, "do_translate_async_stream", fake_translate)
@@ -414,7 +928,7 @@ def test_terminal_journal_write_failure_uses_fail_stop(tmp_path, monkeypatch):
     def fail_persist(_path, _event):
         raise OSError("disk unavailable")
 
-    def fake_fail_stop(_job_id, _error):
+    def fake_fail_stop(_job_id, _error, _request=None):
         raise FailStopObservedError
 
     monkeypatch.setattr(worker_api, "_persist_terminal_event", fail_persist)

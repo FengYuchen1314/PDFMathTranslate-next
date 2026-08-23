@@ -1,0 +1,29 @@
+services:
+  translator:
+    environment:
+      # Pre-admin worker images still resolve their optional DeepSeek key from
+      # the environment. rollback.env deliberately preserves this legacy key.
+      PDF2ZH_DEEPSEEK_API_KEY: "${PDF2ZH_DEEPSEEK_API_KEY:-}"
+    volumes:
+      - translator-cache:/home/app/.cache
+      - translator-config:/home/app/.config/pdf2zh
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import json,os,urllib.request;
+          r=urllib.request.Request('http://127.0.0.1:8000/internal/health',headers={'x-worker-token':os.environ['PDF2ZH_WORKER_TOKEN']});
+          p=json.load(urllib.request.urlopen(r,timeout=3));
+          assert p['status']=='ok' and p.get('provider')=='google'"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  translator-cache:
+    external: true
+    name: "${PDF2ZH_LEGACY_TRANSLATOR_CACHE_VOLUME:?set the backed-up legacy cache volume}"
+  translator-config:
+    external: true
+    name: "${PDF2ZH_LEGACY_TRANSLATOR_CONFIG_VOLUME:?set the backed-up legacy config volume}"

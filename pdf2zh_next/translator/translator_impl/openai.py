@@ -1,3 +1,4 @@
+import hashlib
 import logging
 
 import httpx
@@ -6,13 +7,20 @@ from babeldoc.utils.atomic_integer import AtomicInteger
 from pdf2zh_next.config.model import SettingsModel
 from pdf2zh_next.translator.base_rate_limiter import BaseRateLimiter
 from pdf2zh_next.translator.base_translator import BaseTranslator
-from tenacity import before_sleep_log
 from tenacity import retry
 from tenacity import retry_if_exception_type
 from tenacity import stop_after_attempt
 from tenacity import wait_exponential
 
 logger = logging.getLogger(__name__)
+
+
+def _log_retry_without_request_details(retry_state) -> None:
+    error = retry_state.outcome.exception() if retry_state.outcome else None
+    logger.warning(
+        "Retrying OpenAI-compatible request after %s",
+        type(error).__name__ if error is not None else "unknown error",
+    )
 
 
 class OpenAITranslator(BaseTranslator):
@@ -26,14 +34,17 @@ class OpenAITranslator(BaseTranslator):
     ):
         super().__init__(settings, rate_limiter)
         self.timeout = settings.translate_engine_settings.openai_timeout
+        self._api_key = settings.translate_engine_settings.openai_api_key or ""
         self.client = openai.OpenAI(
             base_url=settings.translate_engine_settings.openai_base_url,
             api_key=settings.translate_engine_settings.openai_api_key,
             timeout=float(self.timeout) if self.timeout else openai.NOT_GIVEN,
             http_client=httpx.Client(
+                trust_env=False,
+                follow_redirects=False,
                 limits=httpx.Limits(
                     max_connections=None, max_keepalive_connections=None
-                )
+                ),
             ),
         )
         self.options = {}
@@ -41,6 +52,21 @@ class OpenAITranslator(BaseTranslator):
         self.reasoning_effort = (
             settings.translate_engine_settings.openai_reasoning_effort
         )
+        base_url = (settings.translate_engine_settings.openai_base_url or "").rstrip(
+            "/"
+        )
+        # A model name alone is not a sufficient cache namespace for an
+        # OpenAI-compatible endpoint. Different providers (and credential
+        # rotations at the same provider) can legitimately return different
+        # translations. Keep the key itself out of the cache while ensuring
+        # those upstream identities never share entries.
+        upstream_identity = hashlib.sha256(
+            f"{base_url}\0{self._api_key}".encode()
+        ).hexdigest()
+        self.add_cache_impact_parameters("upstream_identity", upstream_identity)
+        if base_url in {"https://api.deepseek.com", "https://api.deepseek.com/v1"}:
+            if self.reasoning_effort == "low":
+                self.reasoning_effort = "high"
         self.send_temperature = (
             settings.translate_engine_settings.openai_send_temprature
         )
@@ -73,11 +99,17 @@ class OpenAITranslator(BaseTranslator):
         if self.enable_json_mode:
             self.add_cache_impact_parameters("enable_json_mode", self.enable_json_mode)
 
+    def _redacted_error(self, error: object) -> str:
+        message = " ".join(str(error or "").split())
+        if self._api_key:
+            message = message.replace(self._api_key, "<redacted>")
+        return message[:240] or "unknown error"
+
     @retry(
         retry=retry_if_exception_type(openai.RateLimitError),
         stop=stop_after_attempt(100),
         wait=wait_exponential(multiplier=1, min=1, max=15),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
+        before_sleep=_log_retry_without_request_details,
     )
     def do_translate(self, text, rate_limit_params: dict = None) -> str:
         options = self.options.copy()
@@ -112,7 +144,11 @@ class OpenAITranslator(BaseTranslator):
                         response.usage.prompt_tokens_details.cached_tokens
                     )
         except Exception as e:
-            logger.error(f"Error getting token usage: {e}")
+            logger.error(
+                "Error getting token usage (%s): %s",
+                type(e).__name__,
+                self._redacted_error(e),
+            )
             pass
         message = response.choices[0].message.content.strip()
         message = self._remove_cot_content(message)
@@ -122,7 +158,7 @@ class OpenAITranslator(BaseTranslator):
         retry=retry_if_exception_type(openai.RateLimitError),
         stop=stop_after_attempt(100),
         wait=wait_exponential(multiplier=1, min=1, max=15),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
+        before_sleep=_log_retry_without_request_details,
     )
     def do_llm_translate(self, text, rate_limit_params: dict = None):
         if text is None:
@@ -164,7 +200,11 @@ class OpenAITranslator(BaseTranslator):
                         response.usage.prompt_tokens_details.cached_tokens
                     )
         except Exception as e:
-            logger.error(f"Error getting token usage: {e}")
+            logger.error(
+                "Error getting token usage (%s): %s",
+                type(e).__name__,
+                self._redacted_error(e),
+            )
             pass
         message = response.choices[0].message.content.strip()
         message = self._remove_cot_content(message)

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:531f855bda2c73cd6ef67d56b733b357cea384185b3022bd09f05e002cd144ca
 WORKDIR /app
 
 RUN apt-get update \
@@ -32,5 +32,10 @@ ENV HOME=/home/app \
 USER app
 RUN babeldoc --version && babeldoc --warmup
 
+USER root
 EXPOSE 8000
-CMD ["python", "-m", "pdf2zh_next.worker_supervisor"]
+# Compose adds Tini with `init: true`; clear any inherited entrypoint so its
+# sole application child is this one-shot supervisor. The supervisor spawns
+# Uvicorn exactly once and then exits with it, forcing a Docker-level restart.
+ENTRYPOINT []
+CMD ["python", "/app/pdf2zh_next/worker_supervisor.py"]
