@@ -20,7 +20,7 @@ x-logging: &default-logging
 
 services:
   init:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-ops:${PDF2ZH_IMAGE_TAG:-sha-release-pending}
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-ops:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
     user: "0:0"
     restart: "no"
     network_mode: none
@@ -46,7 +46,7 @@ services:
       - ./tls/acme:/run/pdf2zh-init-tls/acme
 
   translator:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-translator:${PDF2ZH_IMAGE_TAG:-sha-release-pending}
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-translator:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
     init: true
     restart: unless-stopped
     stop_grace_period: 60s
@@ -99,7 +99,7 @@ services:
       start_period: 30s
 
   web:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-web:${PDF2ZH_IMAGE_TAG:-sha-release-pending}
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-web:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
     init: true
     restart: unless-stopped
     stop_grace_period: 360s
@@ -156,7 +156,7 @@ services:
       start_period: 10s
 
   gateway:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-gateway:${PDF2ZH_IMAGE_TAG:-sha-release-pending}
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-gateway:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
     init: true
     restart: unless-stopped
     ports:
@@ -201,7 +201,7 @@ services:
       start_period: 15s
 
   certbot:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-ops:${PDF2ZH_IMAGE_TAG:-sha-release-pending}
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-ops:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
     init: true
     restart: unless-stopped
     entrypoint: ["/usr/local/bin/pdf2zh-certbot-loop"]
