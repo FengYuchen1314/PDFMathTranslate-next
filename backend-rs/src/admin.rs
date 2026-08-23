@@ -304,8 +304,8 @@ impl AdminService {
             Ok(origin) => origin,
             Err(_) => match env::var("PDF2ZH_PUBLIC_IP") {
                 Ok(public_ip) => {
-                    let public_port = env::var("PDF2ZH_PUBLIC_PORT")
-                        .unwrap_or_else(|_| port.to_string());
+                    let public_port =
+                        env::var("PDF2ZH_PUBLIC_PORT").unwrap_or_else(|_| port.to_string());
                     format!("https://{public_ip}:{public_port}")
                 }
                 Err(_) => format!("http://127.0.0.1:{port}"),
