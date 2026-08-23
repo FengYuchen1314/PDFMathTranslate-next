@@ -16,7 +16,7 @@ x-logging: &default-logging
 
 services:
   init:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-ops:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-ops:${PDF2ZH_IMAGE_TAG:-sha-96358130149a1f041127c7053addd76a9cd0abbc}
     user: "0:0"
     restart: "no"
     network_mode: none
@@ -36,7 +36,7 @@ services:
       - ./secrets/worker:/run/pdf2zh-init-secrets/worker
 
   translator:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-translator:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-translator:${PDF2ZH_IMAGE_TAG:-sha-96358130149a1f041127c7053addd76a9cd0abbc}
     init: true
     restart: unless-stopped
     stop_grace_period: 60s
@@ -89,7 +89,7 @@ services:
       start_period: 30s
 
   web:
-    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-web:${PDF2ZH_IMAGE_TAG:-sha-ec4de468ab55cc28154b79ed3db633742512a94d}
+    image: ghcr.io/fengyuchen1314/pdfmathtranslate-next-web:${PDF2ZH_IMAGE_TAG:-sha-96358130149a1f041127c7053addd76a9cd0abbc}
     init: true
     restart: unless-stopped
     stop_grace_period: 360s
