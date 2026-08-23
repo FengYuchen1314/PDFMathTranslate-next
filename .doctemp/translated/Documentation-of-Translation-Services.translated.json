@@ -1,0 +1,294 @@
+{
+  "source_file": "/Users/pppppop/Documents/PDFMathTranslate-next/docs/en/advanced/Documentation-of-Translation-Services.md",
+  "source_lang": "en",
+  "outputs": [
+    {
+      "chunk_id": "chunk_9221A870",
+      "chunk_type": "paragraph",
+      "original_content": "[**Advanced**](./introduction.md) > **Documentation of Translation Services** _(current)_\n",
+      "start_line_no": 1,
+      "translations": {
+        "zh_TW": "[**高級選項**](./introduction.md) > **翻譯服務文檔** _(當前)_\n",
+        "ko": "[**고급 옵션**](./introduction.md) > **번역 서비스 문서** _(현재)_\n",
+        "fr": "[**Options avancées**](./introduction.md) > **Documentation des services de traduction** _(actuel)_\n",
+        "pt": "[**Opções avançadas**](./introduction.md) > **Documentação dos serviços de tradução** _(atual)_\n",
+        "ru": "[**Расширенные параметры**](./introduction.md) > **Документация служб перевода** _(текущая)_\n",
+        "it": "[**Opzioni avanzate**](./introduction.md) > **Documentazione dei servizi di traduzione** _(corrente)_\n",
+        "es": "[**Opciones avanzadas**](./introduction.md) > **Documentación de servicios de traducción** _(actual)_\n",
+        "de": "[**Erweiterte Optionen**](./introduction.md) > **Dokumentation der Übersetzungsdienste** _(aktuell)_\n",
+        "zh": "[**高级选项**](./introduction.md) > **翻译服务文档** _(当前)_\n",
+        "ja": "[**高度な設定**](./introduction.md) > **翻訳サービスドキュメント** _(現在)_\n"
+      }
+    },
+    {
+      "chunk_id": "h_rule_e0a05fa1",
+      "chunk_type": "h_rule",
+      "original_content": "---\n",
+      "start_line_no": 3,
+      "translations": {
+        "zh": "---\n",
+        "zh_TW": "---\n",
+        "ja": "---\n",
+        "ko": "---\n",
+        "ru": "---\n",
+        "es": "---\n",
+        "fr": "---\n",
+        "de": "---\n",
+        "it": "---\n",
+        "pt": "---\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_7775DA81",
+      "chunk_type": "header",
+      "original_content": "### Viewing Available Translate Services via Command Line\n",
+      "start_line_no": 5,
+      "translations": {
+        "zh": "### 通过命令行查看可用的翻译服务\n",
+        "ru": "### Просмотр доступных служб перевода через командную строку\n",
+        "pt": "### Visualizando Serviços de Tradução Disponíveis via Linha de Comando\n",
+        "es": "### Ver servicios de traducción disponibles a través de la línea de comandos\n",
+        "fr": "### Affichage des services de traduction disponibles via la ligne de commande\n",
+        "zh_TW": "### 通過命令行查看可用的翻譯服務\n",
+        "ko": "### 명령줄을 통해 사용 가능한 번역 서비스 확인하기\n",
+        "de": "### Anzeige verfügbarer Übersetzungsdienste über die Kommandozeile\n",
+        "ja": "### コマンドラインで利用可能な翻訳サービスを表示する\n",
+        "it": "### Visualizzazione dei servizi di traduzione disponibili tramite riga di comando\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_4919DFD2",
+      "chunk_type": "paragraph",
+      "original_content": "You can confirm the available translate services and their usage by printing the help message in the command line.\n",
+      "start_line_no": 7,
+      "translations": {
+        "zh_TW": "您可以通過在命令行中打印幫助訊息來確認可用的翻譯服務及其使用方法。\n",
+        "zh": "您可以通过在命令行中打印帮助信息来确认可用的翻译服务及其使用方法。\n",
+        "ru": "Вы можете подтвердить доступные службы перевода и их использование, напечатав справочное сообщение в командной строке.\n",
+        "ko": "명령줄에서 도움말 메시지를 출력하여 사용 가능한 번역 서비스와 그 사용법을 확인할 수 있습니다.\n",
+        "fr": "Vous pouvez vérifier les services de traduction disponibles et leur utilisation en affichant le message d'aide dans la ligne de commande.\n",
+        "es": "Puedes confirmar los servicios de traducción disponibles y su uso imprimiendo el mensaje de ayuda en la línea de comandos.\n",
+        "pt": "Você pode confirmar os serviços de tradução disponíveis e seu uso imprimindo a mensagem de ajuda na linha de comando.\n",
+        "de": "Sie können die verfügbaren Übersetzungsdienste und deren Verwendung bestätigen, indem Sie die Hilfemeldung in der Kommandozeile ausgeben.\n",
+        "it": "Puoi confermare i servizi di traduzione disponibili e il loro utilizzo stampando il messaggio di aiuto nella riga di comando.\n",
+        "ja": "コマンドラインでヘルプメッセージを表示することで、利用可能な翻訳サービスとその使い方を確認できます。\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_756565E6",
+      "chunk_type": "code_block",
+      "original_content": "```bash\npdf2zh_next -h\n```\n",
+      "start_line_no": 9,
+      "translations": {
+        "zh": "```bash\npdf2zh_next -h\n```\n",
+        "zh_TW": "```bash\npdf2zh_next -h\n```\n",
+        "ja": "```bash\npdf2zh_next -h\n```\n",
+        "ko": "```bash\npdf2zh_next -h\n```\n",
+        "ru": "```bash\npdf2zh_next -h\n```\n",
+        "es": "```bash\npdf2zh_next -h\n```\n",
+        "fr": "```bash\npdf2zh_next -h\n```\n",
+        "de": "```bash\npdf2zh_next -h\n```\n",
+        "it": "```bash\npdf2zh_next -h\n```\n",
+        "pt": "```bash\npdf2zh_next -h\n```\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_C2A1A031",
+      "chunk_type": "paragraph",
+      "original_content": "At the end of the help message, you can view detailed information about the different translation services.\n\n",
+      "start_line_no": 13,
+      "translations": {
+        "zh": "在帮助信息的末尾，您可以查看不同翻译服务的详细信息。\n\n",
+        "zh_TW": "在幫助訊息的最後，您可以查看不同翻譯服務的詳細資訊。\n\n",
+        "ru": "В конце сообщения справки вы можете просмотреть подробную информацию о различных службах перевода.\n\n",
+        "ja": "ヘルプメッセージの末尾で、さまざまな翻訳サービスの詳細情報を確認できます。\n\n",
+        "ko": "도움말 메시지의 끝에서 다양한 번역 서비스에 대한 자세한 정보를 확인할 수 있습니다.\n\n",
+        "pt": "No final da mensagem de ajuda, você pode visualizar informações detalhadas sobre os diferentes serviços de tradução.\n\n",
+        "it": "Alla fine del messaggio di aiuto, puoi visualizzare informazioni dettagliate sui diversi servizi di traduzione.\n\n",
+        "es": "Al final del mensaje de ayuda, puedes ver información detallada sobre los diferentes servicios de traducción.\n\n",
+        "de": "Am Ende der Hilfemeldung können Sie detaillierte Informationen zu den verschiedenen Übersetzungsdiensten einsehen.\n\n",
+        "fr": "À la fin du message d'aide, vous pouvez consulter des informations détaillées sur les différents services de traduction.\n\n"
+      }
+    },
+    {
+      "chunk_id": "h_rule_806f6d1d",
+      "chunk_type": "h_rule",
+      "original_content": "---\n",
+      "start_line_no": 16,
+      "translations": {
+        "zh": "---\n",
+        "zh_TW": "---\n",
+        "ja": "---\n",
+        "ko": "---\n",
+        "ru": "---\n",
+        "es": "---\n",
+        "fr": "---\n",
+        "de": "---\n",
+        "it": "---\n",
+        "pt": "---\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_2DBF0B10",
+      "chunk_type": "header",
+      "original_content": "### Translation Engine Support Policy\n",
+      "start_line_no": 18,
+      "translations": {
+        "zh": "### 翻译引擎支持政策\n",
+        "zh_TW": "### 翻譯引擎支持政策\n",
+        "ko": "### 번역 엔진 지원 정책\n",
+        "it": "### Politica di supporto del motore di traduzione\n",
+        "ru": "### Политика поддержки движков перевода\n",
+        "fr": "### Politique de support des moteurs de traduction\n",
+        "ja": "### 翻訳エンジンサポートポリシー\n",
+        "de": "### Übersetzungs-Engine-Unterstützungsrichtlinie\n",
+        "pt": "### Política de Suporte para Mecanismos de Tradução\n",
+        "es": "### Política de soporte de motores de traducción\n\npdf2zh utiliza múltiples servicios de traducción para proporcionar traducciones de alta calidad. Sin embargo, debido a las políticas de uso de cada servicio, es posible que algunos servicios no estén disponibles en ciertas regiones o que requieran configuración adicional.\n\n#### Servicios de traducción soportados\n\nActualmente, pdf2zh soporta los siguientes servicios de traducción:\n\n1. **DeepL** - Traducción de alta calidad, requiere clave API\n2. **Google Translate** - Servicio gratuito, sin necesidad de clave API\n3. **Microsoft Translator** - Traducción empresarial, requiere clave API\n4. **OpenAI GPT** - Traducción basada en IA, requiere clave API\n5. **Claude** - Traducción basada en IA, requiere clave API\n6. **Gemini** - Traducción basada en IA, requiere clave API\n7. **Ollama** - Traducción local, requiere configuración del modelo\n\n#### Política de disponibilidad\n\n1. **Servicios gratuitos**\n   - Google Translate: Disponible globalmente, sin restricciones regionales\n   - Ollama: Disponible localmente, requiere instalación del modelo\n\n2. **Servicios de pago**\n   - DeepL: Disponible en la mayoría de las regiones, requiere clave API\n   - Microsoft Translator: Disponible globalmente, requiere clave API\n   - OpenAI GPT: Disponible en la mayoría de las regiones, requiere clave API\n   - Claude: Disponible en la mayoría de las regiones, requiere clave API\n   - Gemini: Disponible en la mayoría de las regiones, requiere clave API\n\n#### Recomendaciones de uso\n\n1. **Para usuarios generales**\n   - Recomendamos usar Google Translate como servicio predeterminado\n   - No requiere configuración, disponible inmediatamente\n\n2. **Para usuarios que requieren alta calidad**\n   - Recomendamos usar DeepL o Microsoft Translator\n   - Requiere registro y obtención de clave API\n\n3. **Para usuarios que requieren privacidad**\n   - Recomendamos usar Ollama para traducción local\n   - Requiere instalación y configuración del modelo\n\n#### Solución de problemas\n\nSi encuentras problemas al usar algún servicio de traducción:\n\n1. **Verifica la conectividad de red**\n   - Asegúrate de que tu red pueda acceder al servicio correspondiente\n\n2. **Verifica la validez de la clave API**\n   - Para servicios que requieren clave API, asegúrate de que la clave sea válida\n\n3. **Cambia el servicio de traducción**\n   - Puedes cambiar a otro servicio de traducción en la configuración\n\n4. **Consulta la documentación**\n   - Consulta la [Documentación de servicios de traducción](./translation-services.md) para obtener información detallada\n\n#### Notas importantes\n\n1. **Límites de uso**\n   - Cada servicio de traducción tiene sus propios límites de uso\n   - Por favor, consulta los términos de servicio del proveedor correspondiente\n\n2. **Costos**\n   - Los servicios de pago pueden incurrir en costos\n   - Por favor, consulta la política de precios del proveedor correspondiente\n\n3. **Disponibilidad regional**\n   - Algunos servicios pueden no estar disponibles en ciertas regiones\n   - Por favor, consulta la cobertura regional del proveedor correspondiente\n\n#### Actualizaciones de política\n\nEsta política puede actualizarse periódicamente. Por favor, consulta esta página regularmente para obtener la información más reciente.\n\nPara obtener información más detallada sobre cada servicio de traducción, consulta la [Documentación de servicios de traducción](./translation-services.md).\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_0BB83C9D",
+      "chunk_type": "header",
+      "original_content": "#### Tier 1 (Official Support)\n",
+      "start_line_no": 20,
+      "translations": {
+        "ru": "#### Уровень 1 (Официальная поддержка)\n",
+        "ja": "#### Tier 1 (公式サポート)\n",
+        "pt": "#### Tier 1 (Suporte oficial)\n",
+        "fr": "#### Tier 1 (Support officiel)\n",
+        "zh": "#### Tier 1 (官方支持)\n",
+        "de": "#### Tier 1 (Offizielle Unterstützung)\n",
+        "it": "#### Livello 1 (Supporto ufficiale)\n",
+        "zh_TW": "#### Tier 1 (官方支持)\n",
+        "es": "#### Nivel 1 (Soporte oficial)\n",
+        "ko": "#### Tier 1 (공식 지원)\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_4E37F5F8",
+      "chunk_type": "paragraph",
+      "original_content": "**Tier 1 translation engines** are directly maintained by the project maintainers. Although the maintainers do **not use this project regularly**, they will rely on GitHub issues to identify problems. When any of these engines encounter issues, the maintainers will fix them as soon as possible to ensure stability and reliability.\n\n\nCurrently supported Tier 1 translation engines include:",
+      "start_line_no": 22,
+      "translations": {
+        "zh": "**Tier 1 翻译引擎**由项目维护者直接维护。虽然维护者**不经常使用此项目**，但他们会依赖 GitHub issues 来发现问题。当这些引擎中的任何一个遇到问题时，维护者会尽快修复，以确保稳定性和可靠性。\n\n目前支持的 Tier 1 翻译引擎包括：",
+        "zh_TW": "**Tier 1 翻譯引擎**由項目維護者直接維護。雖然維護者**不經常使用此項目**，但他們會依賴 GitHub issues 來發現問題。當這些引擎中的任何一個遇到問題時，維護者將盡快修復，以確保穩定性和可靠性。\n\n目前支持的 Tier 1 翻譯引擎包括：",
+        "fr": "**Les moteurs de traduction de niveau 1** sont directement maintenus par les responsables du projet. Bien que les responsables **n'utilisent pas ce projet régulièrement**, ils s'appuieront sur les problèmes GitHub pour identifier les problèmes. Lorsque l'un de ces moteurs rencontre des problèmes, les responsables les corrigeront dès que possible pour garantir la stabilité et la fiabilité.\n\nActuellement, les moteurs de traduction de niveau 1 pris en charge incluent :",
+        "pt": "**Motores de tradução Tier 1** são mantidos diretamente pelos mantenedores do projeto. Embora os mantenedores **não usem este projeto regularmente**, eles confiarão em problemas do GitHub para identificar problemas. Quando qualquer um desses mecanismos encontrar problemas, os mantenedores os corrigirão o mais rápido possível para garantir estabilidade e confiabilidade.\n\nAtualmente, os motores de tradução Tier 1 suportados incluem:",
+        "ru": "**Движки перевода уровня 1** находятся под прямым управлением сопровождающих проекта. Хотя сопровождающие **не используют этот проект регулярно**, они будут полагаться на проблемы GitHub для выявления проблем. Когда любой из этих движков столкнется с проблемами, сопровождающие исправят их как можно скорее, чтобы обеспечить стабильность и надежность.\n\nВ настоящее время поддерживаемые движки перевода уровня 1 включают:",
+        "es": "**Los motores de traducción de Nivel 1** son mantenidos directamente por los mantenedores del proyecto. Aunque los mantenedores **no utilizan este proyecto regularmente**, confiarán en los problemas de GitHub para identificar problemas. Cuando cualquiera de estos motores encuentre problemas, los mantenedores los solucionarán lo antes posible para garantizar la estabilidad y la fiabilidad.\n\nActualmente, los motores de traducción de Nivel 1 soportados incluyen:",
+        "ko": "**Tier 1 번역 엔진**은 프로젝트 관리자가 직접 유지 관리합니다. 관리자가 **이 프로젝트를 정기적으로 사용하지는 않지만**, GitHub 이슈를 통해 문제를 파악할 것입니다. 이러한 엔진 중 하나에 문제가 발생하면 관리자는 안정성과 신뢰성을 보장하기 위해 가능한 한 빨리 수정할 것입니다.\n\n현재 지원되는 Tier 1 번역 엔진은 다음과 같습니다:",
+        "it": "**I motori di traduzione di livello 1** sono gestiti direttamente dai manutentori del progetto. Sebbene i manutentori **non utilizzino regolarmente questo progetto**, si baseranno sulle segnalazioni di GitHub per identificare i problemi. Quando uno di questi motori incontra problemi, i manutentori li risolveranno il prima possibile per garantire stabilità e affidabilità.\n\nAttualmente, i motori di traduzione di livello 1 supportati includono:",
+        "ja": "**Tier 1 翻訳エンジン**は、プロジェクトのメンテナーによって直接メンテナンスされています。メンテナーは**このプロジェクトを定期的に使用していませんが**、GitHub のイシューを通じて問題を特定します。これらのエンジンのいずれかが問題に遭遇した場合、メンテナーは安定性と信頼性を確保するために、できるだけ早く修正を行います。\n\n\n現在サポートされている Tier 1 翻訳エンジンは以下の通りです：",
+        "de": "**Tier 1-Übersetzungs-Engines** werden direkt von den Projektbetreuern gewartet. Obwohl die Betreuer **dieses Projekt nicht regelmäßig nutzen**, werden sie sich auf GitHub-Issues verlassen, um Probleme zu identifizieren. Wenn eine dieser Engines auf Probleme stößt, werden die Betreuer diese so schnell wie möglich beheben, um Stabilität und Zuverlässigkeit zu gewährleisten.\n\nDerzeit unterstützte Tier 1-Übersetzungs-Engines umfassen:"
+      }
+    },
+    {
+      "chunk_id": "chunk_610CC359",
+      "chunk_type": "list",
+      "original_content": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n",
+      "start_line_no": 26,
+      "translations": {
+        "ja": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n",
+        "zh": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n",
+        "de": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n",
+        "zh_TW": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n",
+        "ko": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n",
+        "es": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n",
+        "fr": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n",
+        "it": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n",
+        "pt": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n",
+        "ru": "1. SiliconFlowFree\n2. OpenAI\n3. AliyunDashScope\n4. DeepSeek\n5. SiliconFlow\n6. Zhipu\n7. OpenAICompatible\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_939CF562",
+      "chunk_type": "header",
+      "original_content": "#### Tier 2 (Community Support)\n",
+      "start_line_no": 34,
+      "translations": {
+        "zh_TW": "#### Tier 2（社區支持）\n",
+        "ru": "#### Уровень 2 (Поддержка сообщества)\n",
+        "zh": "#### Tier 2（社区支持）\n",
+        "ja": "#### Tier 2 (コミュニティサポート)\n",
+        "de": "#### Tier 2 (Community Support)\n",
+        "es": "#### Tier 2 (Soporte de la comunidad)\n",
+        "it": "#### Tier 2 (Supporto della Comunità)\n",
+        "fr": "#### Tier 2 (Support communautaire)\n",
+        "pt": "#### Tier 2 (Suporte da Comunidade)\n",
+        "ko": "#### Tier 2 (커뮤니티 지원)\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_35662E12",
+      "chunk_type": "paragraph",
+      "original_content": "**Tier 2 translation engines** are maintained and supported by the community.  \nWhen these engines encounter issues, the project maintainers will not provide direct fixes. Instead, they will label the related issues with `help wanted` and welcome pull requests from contributors to help resolve them.\n\nAll engines that are supported by the program but not explicitly listed under Tier 1 are considered Tier 2 translation engines.\n",
+      "start_line_no": 36,
+      "translations": {
+        "zh_TW": "**Tier 2 翻譯引擎**由社區維護和支持。  \n當這些引擎遇到問題時，項目維護者不會直接提供修復。相反，他們會將相關問題標記為 `help wanted`，並歡迎貢獻者提交 pull request 來幫助解決。\n\n所有由程序支持但未明確列在 Tier 1 下的引擎都被視為第二級翻譯引擎。\n",
+        "zh": "**Tier 2 翻译引擎**由社区维护和支持。\n当这些引擎遇到问题时，项目维护者不会直接提供修复。相反，他们会将相关问题标记为 `help wanted`，并欢迎贡献者提交拉取请求来帮助解决。\n\n所有程序支持但未明确列在 Tier 1 下的引擎均被视为 Tier 2 翻译引擎。\n",
+        "ru": "**Движки перевода уровня 2** поддерживаются и обслуживаются сообществом.  \nПри возникновении проблем с этими движками разработчики проекта не будут предоставлять прямые исправления. Вместо этого они пометят связанные проблемы меткой `help wanted` и приветствуют пул-реквесты от участников для их решения.\n\nВсе движки, поддерживаемые программой, но не указанные явно в Уровне 1, считаются движками перевода уровня 2.\n",
+        "fr": "**Les moteurs de traduction de niveau 2** sont maintenus et pris en charge par la communauté.  \nLorsque ces moteurs rencontrent des problèmes, les mainteneurs du projet ne fourniront pas de correctifs directs. Au lieu de cela, ils étiquetteront les problèmes connexes avec `help wanted` et accueilleront les pull requests des contributeurs pour aider à les résoudre.\n\nTous les moteurs pris en charge par le programme mais non explicitement listés sous le niveau 1 sont considérés comme des moteurs de traduction de niveau 2.\n",
+        "it": "**Tier 2 translation engines** sono mantenuti e supportati dalla comunità.  \nQuando questi motori incontrano problemi, i manutentori del progetto non forniranno correzioni dirette. Invece, etichetteranno i problemi correlati con `help wanted` e accoglieranno pull request dai contributori per aiutare a risolverli.\n\nTutti i motori supportati dal programma ma non esplicitamente elencati sotto il Tier 1 sono considerati motori di traduzione di Tier 2.\n",
+        "pt": "**Tier 2 translation engines** são mantidos e suportados pela comunidade.  \nQuando esses mecanismos encontram problemas, os mantenedores do projeto não fornecerão correções diretas. Em vez disso, eles rotularão os problemas relacionados com `help wanted` e darão as boas-vindas a pull requests de contribuidores para ajudar a resolvê-los.\n\nTodos os mecanismos que são suportados pelo programa, mas não listados explicitamente sob Tier 1, são considerados Tier 2 translation engines.\n",
+        "de": "**Tier 2-Übersetzungs-Engines** werden von der Gemeinschaft gepflegt und unterstützt.  \nWenn diese Engines auf Probleme stoßen, werden die Projektbetreuer keine direkten Korrekturen bereitstellen. Stattdessen werden sie die entsprechenden Probleme mit `help wanted` kennzeichnen und Pull-Requests von Mitwirkenden willkommen heißen, um bei der Lösung zu helfen.\n\nAlle Engines, die vom Programm unterstützt werden, aber nicht explizit unter Tier 1 aufgeführt sind, gelten als Tier 2-Übersetzungs-Engines.\n",
+        "es": "**Los motores de traducción de Nivel 2** son mantenidos y soportados por la comunidad.  \nCuando estos motores encuentran problemas, los mantenedores del proyecto no proporcionarán correcciones directas. En su lugar, etiquetarán los problemas relacionados con `help wanted` y darán la bienvenida a las solicitudes de extracción de los contribuyentes para ayudar a resolverlos.\n\nTodos los motores que son soportados por el programa pero no están explícitamente listados bajo el Nivel 1 se consideran motores de traducción de Nivel 2.\n",
+        "ja": "**Tier 2 翻訳エンジン**はコミュニティによってメンテナンスおよびサポートされています。  \nこれらのエンジンに問題が発生した場合、プロジェクトのメンテナーは直接的な修正を提供せず、関連する問題に `help wanted` ラベルを付け、貢献者からのプルリクエストを歓迎して解決を支援します。\n\nプログラムでサポートされているが、Tier 1 に明示的にリストされていないすべてのエンジンは、Tier 2 翻訳エンジンと見なされます。\n",
+        "ko": "**Tier 2 번역 엔진**은 커뮤니티에 의해 유지 및 지원됩니다.  \n이 엔진에 문제가 발생할 경우, 프로젝트 관리자는 직접적인 수정을 제공하지 않습니다. 대신 관련 이슈에 `help wanted` 라벨을 붙이고, 기여자들의 풀 리퀘스트를 통해 문제 해결을 돕도록 환영합니다.\n\n프로그램에서 지원되지만 Tier 1 에 명시적으로 나열되지 않은 모든 엔진은 Tier 2 번역 엔진으로 간주됩니다.\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_DCD0732A",
+      "chunk_type": "header",
+      "original_content": "#### Deprecated Engines\n",
+      "start_line_no": 41,
+      "translations": {
+        "ru": "#### Устаревшие движки\n",
+        "es": "#### Motores obsoletos\n",
+        "pt": "#### Motores Descontinuados\n",
+        "zh_TW": "#### 已棄用的引擎\n",
+        "zh": "#### 已弃用的引擎\n",
+        "de": "#### Veraltete Engines\n",
+        "it": "#### Motori deprecati\n",
+        "ja": "#### 非推奨エンジン\n",
+        "ko": "#### 지원 중단된 엔진\n",
+        "fr": "#### Moteurs obsolètes\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_7C961DFD",
+      "chunk_type": "paragraph",
+      "original_content": "The following translation engines have been **deprecated** and will no longer be maintained or supported:\n",
+      "start_line_no": 43,
+      "translations": {
+        "zh": "以下翻译引擎已被**弃用**，将不再维护或支持：\n",
+        "zh_TW": "以下翻譯引擎已被**棄用**，將不再進行維護或支持：\n",
+        "fr": "Les moteurs de traduction suivants ont été **obsolètes** et ne seront plus maintenus ou supportés :\n",
+        "it": "I seguenti motori di traduzione sono stati **deprecati** e non saranno più mantenuti o supportati:\n",
+        "ru": "Следующие движки перевода были **устаревшими** и больше не будут поддерживаться или обновляться:\n",
+        "es": "Los siguientes motores de traducción han sido **obsoletos** y ya no serán mantenidos ni soportados:\n",
+        "ja": "以下の翻訳エンジンは**非推奨**となり、今後はメンテナンスやサポートが行われません：\n",
+        "de": "Die folgenden Übersetzungs-Engines wurden **veraltet** und werden nicht mehr gewartet oder unterstützt:\n",
+        "ko": "다음 번역 엔진들은 **지원 중단**되었으며, 더 이상 유지보수나 지원이 제공되지 않습니다:\n",
+        "pt": "Os seguintes mecanismos de tradução foram **descontinuados** e não serão mais mantidos ou suportados:\n"
+      }
+    },
+    {
+      "chunk_id": "chunk_2ADE6979",
+      "chunk_type": "list",
+      "original_content": "1. Bing\n2. Google\n",
+      "start_line_no": 45,
+      "translations": {
+        "zh_TW": "1. Bing\n2. Google\n",
+        "ja": "1. Bing\n2. Google\n",
+        "zh": "1. Bing\n2. Google\n",
+        "ko": "1. Bing\n2. Google\n",
+        "es": "1. Bing\n2. Google\n",
+        "ru": "1. Bing\n2. Google\n",
+        "fr": "1. Bing\n2. Google\n",
+        "de": "1. Bing\n2. Google\n",
+        "pt": "1. Bing\n2. Google\n",
+        "it": "1. Bing\n2. Google\n"
+      }
+    }
+  ]
+}

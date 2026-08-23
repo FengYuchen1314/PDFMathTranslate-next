@@ -1,0 +1,122 @@
+name: Bug Report
+description: Create a report to help us improve
+labels: ['bug']
+body:
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you asking
+      options:
+      - label: I have searched the existing issues
+        required: true
+      - label: I spend at least 5 minutes for thinking and preparing
+        required: true
+      - label: I have thoroughly and completely read the wiki.
+        required: true
+      - label: I have carefully checked the issue, and it is unrelated to the network environment.
+        required: true
+      - label: I have filled in the environment information
+        required: true
+      - label: I have uploaded the original file, or confirmed that the issue is unrelated to the original file
+        required: true
+      - label: I have uploaded logs, or acknowledge that not uploading logs will cause this issue to be closed directly
+        required: true
+      - label: I confirm that this issue is not related to the project's API (Before the API documentation is released, any questions regarding API usage will not be accepted!)
+        required: true
+      - label: I have confirmed that due to limited resources, the maintainers of this project do not have the ability to provide high-quality answers. If you have high requirements for the answer quality, please do not submit an issue.
+        required: true
+      - label: I have confirmed that this project is provided "as is" under the AGPL v3 license, and no guarantees are provided for the quality and performance of the program. **The entire risk of the program's quality and performance is borne by you.** If the program is found to be defective, you will be responsible for all necessary service, repair, or correction costs.
+        required: true
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for using this project and providing feedback!
+        Please confirm again that the above checklist items have been carefully executed! (If you have not carefully executed them, the issue will be closed directly without any response)
+
+        Please also note:
+        > [!WARNING]
+        >
+        > Due to limited resources, the maintainers of this project do not have the ability to provide high-quality answers. If you have high requirements for the answer quality, please do not submit an issue.
+        >
+        > Due to the maintainers' limited energy, we do not provide any form of usage assistance or problem-solving. Related issues will be closed directly! (Pull requests to improve project documentation are welcome; bugs or friendly issues that follow the issue template are not affected by this)
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment (Please specify the version of pdf2zh & BabelDOC, issues without version information will be closed directly)
+      placeholder: |
+          - **OS**: Ubuntu 24.10
+          - **Python**: 3.12.0
+          - **pdf2zh**: 2.0.0
+          - **BabelDOC**: 0.3.69
+      render: markdown
+    validations:
+      required: false
+  - type: textarea
+    id: translation-config
+    attributes:
+      label: Please paste the translation engine configuration you are using. Issues without specifying the configuration will be closed directly.
+      render: markdown
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How to install pdf2zh_next
+      options:
+        - pip
+        - exe
+        - source
+        - docker
+    validations:
+      required: true
+  - type: textarea
+    id: describe
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: To Reproduce
+      description: Steps to reproduce the behavior
+      value: |
+        1. execute '...'
+        2. select '....'
+        3. see errors
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: |
+        Please copy and paste any relevant log output. It's recommended to save the log to a .txt file and upload it. Issues without logs will be closed directly.
+      render: Text
+    validations:
+      required: false
+  - type: textarea
+    id: PDFfile
+    attributes:
+      label: Origin PDF file
+      description: |
+        Please provide the original PDF file to facilitate reproduction of the error. (If the issue requires the original file to reproduce, but you did not provide it, the issue will be closed directly)
+    validations:
+      required: false
+  - type: textarea
+    id: others
+    attributes:
+      label: Anything else?
+      description: |
+        Related configs? Links? References?
+        Anything that will give us more context about the issue you are encountering!
+    validations:
+      required: false

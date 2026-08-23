@@ -1,0 +1,68 @@
+name: docs
+on:
+  push:
+    branches:
+      - main
+permissions:
+  contents: write
+jobs:
+  check-repository:
+    name: Check if running in main repository
+    runs-on: ubuntu-latest
+    outputs:
+      # debug purpose
+      is_main_repo: ${{ github.repository == 'PDFMathTranslate-next/PDFMathTranslate-next' }}
+    steps:
+      - run: echo "Running repository check"
+  deploy:
+    needs: check-repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Delete CNAME if not in main repository
+        if: needs.check-repository.outputs.is_main_repo == 'false'
+        run: rm docs/CNAME
+      - name: Process homepage
+        run: |
+          sed 's|./docs|./|g' README.md > docs/index.md
+      - name: Configure Git Credentials
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+      - name: Setup uv with Python 3.13
+        uses: astral-sh/setup-uv@ed21f2f24f8dd64503750218de024bcf64c7250a # v7.1.5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          activate-environment: true
+
+      - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV 
+      - uses: actions/cache@v4
+        with:
+          key: mkdocs-material-${{ env.cache_id }}
+          path: .cache
+          restore-keys: |
+            mkdocs-material-
+      - run: uv sync
+      - name: Copy zh_TW language file
+        run: cp docs/zh_TW.html /home/runner/work/PDFMathTranslate-next/PDFMathTranslate-next/.venv/lib/python3.13/site-packages/material/templates/partials/languages/
+      - run: uv run mkdocs gh-deploy --force
+  clear-cache:
+    needs:
+      - deploy
+      - check-repository
+    if: needs.check-repository.outputs.is_main_repo == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sleep for 30 seconds
+        run: sleep 30s
+        shell: bash
+      - name: Cloudflare Purge Cache
+        uses: jakejarvis/cloudflare-purge-action@eee6dba0236093358f25bb1581bd615dc8b3d8e3 # v0.3.0
+        env:
+          # Zone is required by both authentication methods
+          CLOUDFLARE_ZONE: ${{ secrets.PDF2ZH_NEXT_COM_CLOUDFLARE_ZONE }}
+          CLOUDFLARE_TOKEN: ${{ secrets.PDF2ZH_NEXT_COM_CLOUDFLARE_TOKEN }}
