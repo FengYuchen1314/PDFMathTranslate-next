@@ -2420,8 +2420,8 @@ mod tests {
     fn dynamic_origin_validation_supports_ip_domain_ports_and_ipv6() {
         for (origin, host, expected) in [
             (
-                "http://192.0.2.10:8199",
-                "192.0.2.10:8199",
+                "http://192.0.2.10:38100",
+                "192.0.2.10:38100",
                 CookieTransport::Http,
             ),
             (
@@ -2435,8 +2435,8 @@ mod tests {
                 CookieTransport::Https,
             ),
             (
-                "http://[2001:db8::1]:8199",
-                "[2001:db8::1]:8199",
+                "http://[2001:db8::1]:38100",
+                "[2001:db8::1]:38100",
                 CookieTransport::Http,
             ),
             (

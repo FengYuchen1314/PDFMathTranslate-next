@@ -53,7 +53,7 @@ def assert_root_compose(config: dict[str, object]) -> None:
     ports = services["web"]["ports"]
     assert len(ports) == 1, ports
     assert ports[0]["target"] == 7860, ports
-    assert str(ports[0]["published"]) == "8199", ports
+    assert str(ports[0]["published"]) == "38100", ports
     environment = services["web"].get("environment", {})
     assert FORBIDDEN_WEB_ENV.isdisjoint(environment), environment
 
@@ -68,6 +68,25 @@ def assert_readme_copy() -> None:
     assert embedded.startswith("```yaml\n") and embedded.endswith("\n```")
     embedded = embedded.removeprefix("```yaml\n").removesuffix("\n```")
     assert embedded + "\n" == COMPOSE.read_text(encoding="utf-8")
+
+
+def assert_listen_override() -> None:
+    environment = os.environ.copy()
+    environment["PDF2ZH_LISTEN"] = "39000"
+    ports = compose_config(COMPOSE, environment=environment)["services"]["web"][
+        "ports"
+    ]
+    assert len(ports) == 1, ports
+    assert str(ports[0]["published"]) == "39000", ports
+    assert "host_ip" not in ports[0], ports
+
+    environment["PDF2ZH_LISTEN"] = "127.0.0.1:39000"
+    ports = compose_config(COMPOSE, environment=environment)["services"]["web"][
+        "ports"
+    ]
+    assert len(ports) == 1, ports
+    assert str(ports[0]["published"]) == "39000", ports
+    assert ports[0]["host_ip"] == "127.0.0.1", ports
 
 
 def assert_acceptance_overlay() -> None:
@@ -92,6 +111,7 @@ def assert_acceptance_overlay() -> None:
 def main() -> None:
     assert_root_compose(compose_config(COMPOSE))
     assert_readme_copy()
+    assert_listen_override()
     assert_acceptance_overlay()
     run("sh", "-n", str(REPO_ROOT / "deploy" / "portable-init.sh"))
     print("portable_compose_contract=passed", flush=True)

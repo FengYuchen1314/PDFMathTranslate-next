@@ -4,7 +4,7 @@ The server deployment consists of three containers and publishes one ordinary
 HTTP port:
 
 ```text
-browser ── HTTP :8199 ──> Rust API + React frontend
+browser ── HTTP :38100 ──> Rust API + React frontend
                               │ private worker network
                               ▼
                          FastAPI worker
@@ -15,7 +15,7 @@ one-shot init ──> data/ + secrets/
 - `web` is the public Rust coordinator. It owns authentication, provider
   configuration, uploads, the job state machine, artifacts, leases, and the
   React application. Its container port is 7860 and Compose publishes it as
-  host port 8199.
+  host port 38100.
 - `translator` is the private Python/FastAPI BabelDOC bridge. It is reachable
   only from `web` on the Compose network and always runs one translation at a
   time.
@@ -100,7 +100,7 @@ place of the browser-controlled `Origin` on a state-changing request.
 `PDF2ZH_PUBLIC_ORIGIN` remains an optional strict origin pin for specialized
 deployments. It is not needed by the distributed Compose file.
 
-`PDF2ZH_TRUST_X_FORWARDED_FOR` defaults to false. Enabling it while port 8199 is
+`PDF2ZH_TRUST_X_FORWARDED_FOR` defaults to false. Enabling it while port 38100 is
 public would let clients forge their rate-limit source. Operators who require
 forwarded client addresses must first restrict the backend port to a trusted
 proxy path.
@@ -111,15 +111,18 @@ Copy the complete `compose.yml` from the repository README into an empty
 directory and run:
 
 ```bash
-docker compose up -d --pull always --remove-orphans --wait --wait-timeout 600
+docker compose up -d --pull always --remove-orphans
 ```
 
 The target server pulls three multi-architecture GHCR images and does not need
 the source tree or a compiler. The default endpoint is:
 
 ```text
-http://SERVER_IP:8199
+http://SERVER_IP:38100
 ```
+
+Set `PDF2ZH_LISTEN=39000` on the `docker compose up` command to publish another
+host port, or edit the copied port mapping directly. No `.env` file is needed.
 
 The portable unit contains only:
 
@@ -145,10 +148,10 @@ For a proxy on the same host, change the web port mapping to:
 
 ```yaml
 ports:
-  - "127.0.0.1:8199:7860"
+  - "127.0.0.1:38100:7860"
 ```
 
-Then proxy to `http://127.0.0.1:8199`. The proxy must:
+Then proxy to `http://127.0.0.1:38100`. The proxy must:
 
 - preserve the original `Host`, including a non-standard public port;
 - leave the browser `Origin` unchanged;
@@ -182,7 +185,7 @@ GitHub Actions performs the release gates:
 Server acceptance must use those exact images and an isolated Compose project.
 At minimum it verifies:
 
-1. direct HTTP access on 8199 and automatic HTTP cookies;
+1. direct HTTP access on 38100 and automatic HTTP cookies;
 2. preserved-Host HTTPS proxy access and automatic Secure cookies;
 3. first-admin claim, logout, and login;
 4. anonymous configuration exposing only Google;

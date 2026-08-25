@@ -1,10 +1,11 @@
 name: pdf2zh-next
 
 # Fresh VPS:
-#   docker compose up -d --pull always --remove-orphans --wait --wait-timeout 600
-# The default public endpoint is HTTP on port 8199. No server IP, domain, TLS
-# certificate, or .env file is required. Set PDF2ZH_LISTEN=127.0.0.1:8199 if a
-# reverse proxy on the same host should be the only process reaching the app.
+#   docker compose up -d --pull always --remove-orphans
+# The default public endpoint is HTTP on port 38100. No server IP, domain, TLS
+# certificate, or .env file is required. Set PDF2ZH_LISTEN=39000 to choose a
+# different public port, or PDF2ZH_LISTEN=127.0.0.1:38100 if a reverse proxy on
+# the same host should be the only process reaching the app.
 # Everything required for migration lives in ./data and ./secrets. Never run
 # `docker compose down -v`, and always copy both directories with this file.
 
@@ -101,7 +102,7 @@ services:
       - no-new-privileges:true
     logging: *default-logging
     ports:
-      - "${PDF2ZH_LISTEN:-8199}:7860"
+      - "${PDF2ZH_LISTEN:-38100}:7860"
     depends_on:
       init:
         condition: service_completed_successfully

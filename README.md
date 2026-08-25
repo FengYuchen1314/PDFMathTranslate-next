@@ -52,28 +52,40 @@ The supported server deployment needs only [`compose.yml`](./compose.yml).
 GitHub Actions tests the Python, Rust, and React code and publishes the three
 multi-architecture images to GHCR; the target server never compiles source.
 This path supports rootful Docker on Linux, Docker Compose v2.24 or newer, and
-a local POSIX filesystem. Open inbound TCP port `8199`, put the Compose file in
+a local POSIX filesystem. Open inbound TCP port `38100`, put the Compose file in
 an empty directory, and run:
 
 ```bash
-docker compose up -d --pull always --remove-orphans --wait --wait-timeout 600
+docker compose up -d --pull always --remove-orphans
 ```
+
+首次启动通常需要几十秒；运行 `docker compose ps`，等待 `translator` 和
+`web` 都显示 `healthy` 后再访问。
 
 ### Complete `compose.yml` (copy directly)
 
 多数用户可以直接复制下面的完整内容，保存为 `compose.yml`，然后运行上面的
 命令。无需填写服务器 IP、域名或证书，也不需要下载源码或创建 `.env` 文件。
-启动后直接访问 `http://服务器IP:8199`。
+启动后直接访问 `http://服务器IP:38100`。如需修改宿主机端口，可直接把下面
+Compose 中的 `38100` 改成其他端口，或在启动命令前设置
+`PDF2ZH_LISTEN=新端口`。
+
+例如改为 `39000`：
+
+```bash
+PDF2ZH_LISTEN=39000 docker compose up -d --pull always --remove-orphans
+```
 
 <!-- BEGIN PORTABLE COMPOSE -->
 ```yaml
 name: pdf2zh-next
 
 # Fresh VPS:
-#   docker compose up -d --pull always --remove-orphans --wait --wait-timeout 600
-# The default public endpoint is HTTP on port 8199. No server IP, domain, TLS
-# certificate, or .env file is required. Set PDF2ZH_LISTEN=127.0.0.1:8199 if a
-# reverse proxy on the same host should be the only process reaching the app.
+#   docker compose up -d --pull always --remove-orphans
+# The default public endpoint is HTTP on port 38100. No server IP, domain, TLS
+# certificate, or .env file is required. Set PDF2ZH_LISTEN=39000 to choose a
+# different public port, or PDF2ZH_LISTEN=127.0.0.1:38100 if a reverse proxy on
+# the same host should be the only process reaching the app.
 # Everything required for migration lives in ./data and ./secrets. Never run
 # `docker compose down -v`, and always copy both directories with this file.
 
@@ -170,7 +182,7 @@ services:
       - no-new-privileges:true
     logging: *default-logging
     ports:
-      - "${PDF2ZH_LISTEN:-8199}:7860"
+      - "${PDF2ZH_LISTEN:-38100}:7860"
     depends_on:
       init:
         condition: service_completed_successfully
@@ -216,7 +228,7 @@ networks:
 
 The first start creates `data/` and `secrets/` beside the Compose file. Read the
 one-time administrator claim token locally on the server, then open
-`http://服务器IP:8199/admin`:
+`http://服务器IP:38100/admin`:
 
 ```bash
 sudo cat ./secrets/web/admin-setup-token
@@ -240,13 +252,13 @@ Compose file, `data/`, and `secrets/` are the complete portable unit.
 Raw HTTP does not protect the administrator password, session, or provider API
 keys in transit. Use it only on a trusted network; for an Internet-facing admin
 page, terminate HTTPS in your own Nginx, Caddy, Traefik, or control panel and
-proxy to `http://127.0.0.1:8199`. The application automatically checks the
+proxy to `http://127.0.0.1:38100`. The application automatically checks the
 browser Origin against the forwarded `Host` and selects Secure cookies for an
 HTTPS origin, so no domain needs to be added to Compose. The proxy must preserve
 the original Host including a non-standard port, must not rewrite `Origin`, and
 should disable request/response buffering with an upload limit of at least
 102 MiB and a read timeout of at least one hour. For same-host proxying, change
-the published port to `127.0.0.1:8199:7860` so port 8199 is not public.
+the published port to `127.0.0.1:38100:7860` so port 38100 is not public.
 
 Before packing a migration, wait until the translation queue is idle, stop the
 stack, and archive from its parent directory so ownership and modes are
